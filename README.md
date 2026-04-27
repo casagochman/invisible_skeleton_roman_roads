@@ -1,4 +1,9 @@
- # The Invisible Skeleton: How a 2,000-Year-Old Network Still Decides Who Gets Rich
+**Assessment for CASA0007 – Quantitative Methods, UCL CASA (January 2026)**
+
+  This project was submitted as the CASA0007 final assessment: a public-facing article (styled for outlets like The Conversation or the FT data section) paired with a technical appendix. The brief required applying advanced quantitative
+  methods — regression or multivariate analysis — to an original urban or social question.
+
+  ---
 
   Does living near a Roman road built in 43 AD make you richer in 2025?
 
