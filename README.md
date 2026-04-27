@@ -1,4 +1,4 @@
-⏺ # The Invisible Skeleton: How a 2,000-Year-Old Network Still Decides Who Gets Rich
+ # The Invisible Skeleton: How a 2,000-Year-Old Network Still Decides Who Gets Rich
 
   Does living near a Roman road built in 43 AD make you richer in 2025?
 
