@@ -1,0 +1,3489 @@
+```{r}
+# 1. LOAD LIBRARIES
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(tidyverse, sf, tmap)
+
+# 2. READ THE DATA
+# We use st_read to bring the geopackage into an 'sf' object
+roman_roads <- st_read("data/itinere_roads.gpkg")
+
+# 3. CRS CHECK & REPROJECTION
+# Excellence Tip: Distance calculations in degrees (WGS84) are inaccurate. 
+# We must ensure we are using the British National Grid (meters).
+if (st_crs(roman_roads)$epsg != 27700) {
+  message("Reprojecting to British National Grid...")
+  roman_roads <- st_transform(roman_roads, 27700)
+}
+
+# 4. DATA EXPLORATION
+# Inspect the first few rows to see the attribute table
+print(head(roman_roads))
+
+# 5. INITIAL PLOT
+# Using tmap for a high-quality, zoomable preview
+tmap_mode("view") # Set to interactive mode
+
+tm_shape(roman_roads) +
+  tm_lines(col = "blue", lwd = 2) +
+  tm_layout(title = "Roman Road Network Exploration")
+```
+clip to uk
+
+
+```{r}
+library(janitor)
+# --- 1. LOAD LOCAL MSOA BOUNDARIES ---
+# Using the path you provided
+msoas_uk <- st_read("data/msoa/MSOA_2021_EW_BFE_V8.shp") %>%
+  st_transform(27700) %>%
+  clean_names()
+
+# --- 2. SPATIAL CLIP ---
+# We use the spatial subsetting method to keep only the Roman roads 
+# that fall within these MSOA boundaries.
+roman_roads_uk <- roman_roads[msoas_uk, ]
+```
+
+
+```{r}
+tmap_mode("plot")
+
+msoas_simplified_4326 <- msoas_uk %>%
+  st_simplify(dTolerance = 25) %>% 
+  st_transform(4326)
+
+
+# --- 3. VISUAL CHECK ---
+# Plotting both to ensure they align perfectly.
+# Using 'tmap' for a clean overview.
+tm_shape(msoas_uk) +
+  tm_polygons(col = "beige", border.col = "grey", border.alpha = 0.5) +
+tm_shape(roman_roads_uk) +
+  tm_lines(col = "darkblue", lwd = 1) +
+  tm_layout(main.title = "Study Area: Roman Roads in England & Wales")
+```
+
+
+
+
+Now, let's find the intersections
+
+```{r}
+# --- 1. FIND INTERSECTIONS ---
+intersections_uk <- st_intersection(roman_roads_uk) %>%
+  # Filter to only keep the point geometries (where roads cross)
+  st_collection_extract("POINT") %>%
+  # IMPORTANT: Break any MultiPoints into individual Point rows
+  st_cast("POINT")
+
+# --- 2. CALCULATE DEGREE (CENTRALITY) ---
+# Now that every point is its own row, the counts will match
+roman_nodes_uk <- intersections_uk %>%
+  mutate(
+    x = st_coordinates(.)[,1],
+    y = st_coordinates(.)[,2]
+  ) %>%
+  group_by(x, y) %>%
+  summarise(degree = n(), .groups = 'drop') %>%
+  # Filter for actual junctions (3 or more road-ends meeting)
+  # Note: st_intersection of lines usually gives degree 2 for a simple crossing
+  filter(degree > 0)
+
+# --- 3. VISUAL CHECK ---
+# Let's see the 'Hubs' of Roman Britain
+tm_shape(roman_roads_uk) +
+  tm_lines(col = "grey", alpha = 0.7) +
+tm_shape(roman_nodes_uk) +
+  tm_dots(col = "degree", size = 0.7, palette = "YlOrRd", title = "Junction Importance")
+```
+
+something does not make sense with the degree calc
+
+```{r}
+# 1. DISSOLVE AND NODE
+# This 'unions' everything into one big object and then breaks it at every intersection
+roman_net_clean <- roman_roads_uk %>%
+  st_geometry() %>%      # Work with geometry only for speed
+  st_union() %>%         # Dissolve everything into one
+  st_node() %>%          # Explicitly add nodes at every true intersection
+  st_cast("LINESTRING") %>% # Turn the 'blob' back into individual clean lines
+  st_as_sf()             # Back to a spatial data frame
+
+# 2. FIND THE NODES AGAIN
+# Since the network is now 'noded', the endpoints of the lines ARE the junctions
+roman_nodes_uk <- roman_net_clean %>%
+  st_coordinates() %>%
+  as_tibble() %>%
+  # Group by X and Y to find the meeting points
+  group_by(X, Y) %>%
+  summarise(degree = n(), .groups = 'drop') %>%
+  # FILTERING LOGIC:
+  # Degree 1 = Dead end
+  # Degree 2 = A simple bend or continuous road (not a junction)
+  # Degree 3+ = A true junction (T-junction, Crossroad, etc.)
+  filter(degree >= 3) %>%
+  st_as_sf(coords = c("X", "Y"), crs = 27700)
+
+# 3. CHECK THE STATS
+print("--- Reality Check: Cleaned Degrees ---")
+table(roman_nodes_uk$degree)
+```
+
+
+```{r}
+tmap_mode("view")
+
+msoas_outline_4326 <- msoas_simplified_4326 |>
+  st_union() |>
+  st_boundary()
+
+
+tm_shape(msoas_outline_4326) +
+  tm_polygons(fill = "#f8f8f8", col = "white", col_alpha = 0.5) +
+tm_shape(roman_roads_uk) +
+  tm_lines(col = "gray40", lwd = 0.5, col_alpha = 0.3) +
+tm_shape(roman_nodes_uk) +
+  tm_dots(
+    col = "degree",            # Color the dots based on the 'degree' column
+    size = 0.6,           # Also size them by 'degree'
+    palette = "viridis",       # Use a vibrant color palette (e.g., viridis, plasma, RdYlBu)
+    style = "cat",             # Treat 'degree' as categorical for distinct colors
+    title = "Junction Degree"
+  ) +
+  tm_layout(main.title = "Roman Infrastructure Network", frame = FALSE)
+```
+
+
+Some basic barplot
+
+```{r}
+# 1. BASIC SUMMARY STATS
+# This gives you the Min, Max, Mean, and Median degree
+print("--- Summary Statistics for Roman Junction Degrees ---")
+summary(roman_nodes_uk$degree)
+
+# 2. FREQUENCY TABLE
+# This tells you exactly how many "Hubs" of each type you have
+# e.g., How many 4-way intersections exist in England & Wales?
+print("--- Frequency Table (Degree Counts) ---")
+degree_counts <- table(roman_nodes_uk$degree)
+print(degree_counts)
+
+# 3. VISUALIZATION (For your EDA Chapter)
+# A bar chart is the best way to show the distribution of discrete values like 'degree'
+library(ggplot2)
+
+ggplot(roman_nodes_uk, aes(x = as.factor(degree))) +
+  geom_bar(fill = "darkred", alpha = 0.8) +
+  geom_text(stat='count', aes(label=..count..), vjust=-0.5, size=3.5) +
+  labs(title = "Frequency of Roman Road Junction Degrees",
+       subtitle = "England & Wales Network Analysis",
+       x = "Degree (Number of Intersecting Roads)",
+       y = "Number of Junctions") +
+  theme_minimal()
+```
+
+
+
+# Calculating roman centrality score - naive
+
+```{r}
+# 1. Calculate the distances (Meters)
+dist_matrix <- st_distance(st_centroid(msoas_uk), roman_nodes_uk)
+
+# 2. Extract weights (Junction Degrees)
+w <- roman_nodes_uk$degree
+
+# 3. Apply the Inverse Square Formula
+# Ensure we treat dist_matrix as numeric
+dist_num <- as.numeric(dist_matrix)
+
+# This creates the matrix of 3.3 million values
+# We wrap it in matrix() to ensure it keeps the right shape for rowSums
+gravity_matrix_naive_square_decay <- matrix(1 / ((dist_num + 40)^2), 
+                         nrow = nrow(msoas_uk)) %*% diag(w)
+
+# 4. SUM THE ROWS (This is the crucial step)
+# This turns the 3,377,760 values into exactly 7,264 values
+msoas_simplified_4326$roman_score_naive_square_decay <- rowSums(gravity_matrix_naive_square_decay)
+
+# 5. VERIFY THE DIMENSIONS
+# This should now return 7264
+length(msoas_simplified_4326$roman_score_naive_square_decay)
+
+```
+
+
+viz
+
+```{r}
+# 1. INTERACTIVE VIEW
+tmap_mode("view")
+
+# 2. THE "EQUAL-COUNT" MAP
+# Using 'style = "quantile"' ensures that the "lower group" is spread across 
+# different colors, showing the subtle differences in connectivity.
+tm_shape(msoas_simplified_4326) +
+  tm_polygons(
+    fill = "roman_score_naive_square_decay",
+    palette = "viridis",
+    style = "jenks",      # This is the key: forces equal distribution of colors
+    n = 10,                  # More bins to see more detail
+    title = "Connectivity Deciles",
+    alpha = 0.6,
+    popup.vars = c("Connectivity" = "roman_score_naive_square_decay"),
+    id = "msoa21nm"
+  ) +
+  tm_layout(main.title = "Roman Connectivity: Distribution by Quantile")
+
+```
+
+
+# Decay Winning Model
+
+without the root
+
+
+```{r}
+# 1. CALCULATE RAW EXPONENTIAL SIGNALS (No Root)
+# dist_km_matrix and w should still be in your environment
+
+# 2. CONVERT TO MATRIX & STRIP UNITS WITHOUT FLATTENING
+# We use units::drop_units() or simply matrix(as.numeric()) to keep the shape
+dist_km_matrix <- matrix(as.numeric(dist_matrix) / 1000, 
+                         nrow = nrow(msoas_uk), 
+                         ncol = nrow(roman_nodes_uk))
+
+
+exp_decay_matrix <- exp(-0.09 * dist_km_matrix)
+
+# Multiply each signal by junction degree
+influence_matrix_raw <- sweep(exp_decay_matrix, 2, w, "*")
+
+# 2. SUM WITHOUT THE ROOT
+msoas_uk$adj_decay_score <- rowSums(influence_matrix_raw)
+
+# 3. LOG FOR REGRESSION
+msoas_uk$log_adj_decay_score <- log(msoas_uk$adj_decay_score + 1)
+
+# 4. CHECK THE RANK-SIZE SKEW
+plot_data_re <- msoas_uk %>%
+  st_drop_geometry() %>%
+  arrange(log_adj_decay_score) %>%
+  mutate(rank = row_number())
+
+ggplot(plot_data_re, aes(x = rank, y = log_adj_decay_score)) +
+  geom_col(width = 1, fill = "firebrick4") +
+  labs(title = "Roman Centrality Score by MSOA",
+       subtitle =  "Sorted results, logged",
+       x = "MSOA Rank", y = "Log Score") +
+  theme_minimal()
+```
+
+```{r}
+
+# 2. RENDER THE INTERACTIVE MAP
+tmap_mode("plot")
+
+msoas_simplified_4326$log_adj_decay_score = msoas_uk$log_adj_decay_score
+
+tm_shape(msoas_simplified_4326) +
+  tm_polygons(fill = "log_adj_decay_score",
+              style = "jenks", # Use Jenks to handle the higher skew
+              n = 10,
+              palette = "YlOrBr",
+              alpha = 0.6,
+              lwd = 0,
+              title = "Roman Centrality Score (Log scale)",
+              id = "msoa21nm") +
+  
+  # Overlay the Roman Roads for context
+  tm_shape(roman_roads_uk) +
+  tm_lines(col = "black", 
+           lwd = 0.7, 
+           alpha = 0.7) +
+  
+  tm_basemap(server = "CartoDB.Positron") +
+  tm_view(set.view = c(-1.17, 52.35, 7))
+```
+
+
+```{r}
+library(ggplot2)
+
+# 1. GENERATE THE HISTOGRAM
+ggplot(msoas_uk, aes(x = log_adj_decay_score)) +
+  geom_histogram(fill = "firebrick4", color = "white", bins = 50) +
+  # Add a density line to see the 'shape' clearly
+  geom_density(aes(y = ..count.. * 0.5), color = "black", size = 1) + 
+  labs(title = "Model RE: Raw Exponential (No Root)",
+       subtitle = "Distribution of scores across all 7,264 MSOAs",
+       x = "Log Connectivity Score", 
+       y = "Number of Neighborhoods (Count)") +
+  theme_minimal()
+```
+
+
+
+# Adding Income
+
+```{r}
+library(readxl)
+library(dplyr)
+
+
+# 1. Load only the 'Total annual income' sheet
+# Replace 'your_income_file.xlsx' with your actual filename
+income_raw <- read_excel("data/income.xlsx", 
+                         sheet = "Total annual income", 
+                         skip = 3)
+
+# 2. Clean the data for the join
+# We rename the columns to be 'R-friendly'
+income_clean <- income_raw %>%
+  select(msoa_code = 'MSOA code', 
+         total_income = 'Total annual income (£)')
+  # Ensure the income is treated as a number
+```
+
+
+```{r}
+# 3. Join it to your Model RE spatial data
+# This creates your final dataset: 'msoas_final'
+msoas_with_income <- msoas_uk %>%
+  left_join(income_clean, by = c("msoa21cd" = "msoa_code")) %>%
+  filter(!is.na(total_income)) # Removes any MSOAs without income data
+```
+
+```{r}
+# Check the number of rows
+nrow(msoas_with_income)
+
+# Check the first few rows to ensure income and log_raw_exp_roman are present
+head(msoas_with_income %>% select(msoa21cd, log_adj_decay_score, total_income))
+```
+
+
+```{r}
+# Transfer the columns to the simplified spatial object
+# We use a left_join to ensure we keep the simplified geometry
+# Create a simplified version while staying in BNG (27700)
+msoas_with_income_simplified <- msoas_with_income %>%
+  st_simplify(dTolerance = 25) # Keeps the shape but removes unnecessary detail
+```
+
+Plotting side by side maps
+
+```{r}
+# Set to plot mode
+tmap_mode("plot")
+
+# Map 1: Roman Legacy
+map_roman <- tm_shape(msoas_with_income_simplified) +
+  tm_polygons(fill = "log_adj_decay_score", 
+              style = "jenks", 
+              n = 10, 
+              palette = "YlOrBr", 
+              title = "Roman Score",
+              border.alpha = 0) +
+  tm_layout(frame = FALSE, 
+            main.title = "A: Roman Centrality Score", 
+            main.title.size = 0.8,
+            # Move legend OUTSIDE the map
+            legend.outside = TRUE,
+            legend.outside.position = "right",
+            # Keep it compact
+            legend.title.size = 0.5,
+            legend.text.size = 0.4)
+
+# Map 2: Modern Income
+map_income <- tm_shape(msoas_with_income_simplified) +
+  tm_polygons(fill = "total_income", 
+              style = "jenks", 
+              n = 10, 
+              palette = "Purples", 
+              title = "Income (£)",
+              border.alpha = 0) +
+  tm_layout(frame = FALSE, 
+            main.title = "B: Modern Income", 
+            main.title.size = 0.8,
+            # Move legend OUTSIDE the map
+            legend.outside = TRUE,
+            legend.outside.position = "right",
+            # Keep it compact
+            legend.title.size = 0.5,
+            legend.text.size = 0.4)
+
+# Arrange side-by-side
+tmap_arrange(map_roman, map_income, ncol = 2)
+```
+
+second try - more production ready
+
+```{r}
+library(tmap)
+library(sf)
+
+
+# 1. SETUP: Titles and Palettes
+roman_palette <- "YlOrRd"  # Gold-Orange-Red (Classy for "History")
+income_palette <- "BuPu"   # Blue-Purple (Standard for "Wealth")
+
+# 1. VISUAL FIX: Create the "England Only" Road Network
+# We use st_intersection to cut the roads exactly at the border of your data.
+# (This acts like a cookie cutter)
+
+# 1. Filter for England only (Census codes start with 'E')
+# Check your column name! It is usually 'MSOA21CD' or 'msoa11cd'
+england_msoas <- msoas_uk %>%
+  filter(grepl("^E", msoa21cd)) 
+
+# 2. Unify them into one single outline
+# st_union dissolves internal boundaries to create the "Country Shape"
+england_outline <- st_union(england_msoas)
+
+# 3. Perform the cut (Your original code)
+roman_roads_england <- st_intersection(roman_roads_uk, england_outline)
+```
+
+
+```{r}
+# 2. MAP A: THE ROMAN INFRASTRUCTURE
+map_roman <- tm_shape(msoas_with_income_simplified) +
+  tm_polygons(col = "log_adj_decay_score", 
+              title = "Centrality Score (Log scale)", 
+              style = "jenks", 
+              n = 7, 
+              palette = roman_palette, 
+              border.alpha = 0,
+              colorNA = "grey95") +
+  
+  # Overlay the Road Network
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.8, alpha = 0.7) +
+  
+  # Layout (No Scale Bar to prevent crash)
+  tm_layout(main.title = "The Roman Centrality Score", 
+            main.title.size = 1.0,
+            main.title.fontface = "bold",
+            frame = TRUE,
+            legend.position = c("left", "top"),
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.8,
+            legend.title.size = 0.8,
+            legend.text.size = 0.7)
+
+# 3. MAP B: THE MODERN ECONOMY
+map_income <- tm_shape(msoas_with_income_simplified) +
+  tm_polygons(col = "total_income", 
+              title = "Avg. Income (£)", 
+              style = "jenks", 
+              n = 7, 
+              palette = income_palette, 
+              border.alpha = 0,
+              colorNA = "grey95") +
+  
+  # Overlay the Road Network
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.8, alpha = 0.7) +
+  
+  # Layout
+  tm_layout(main.title = "Average Annual Income (2023)", 
+            main.title.size = 1.0,
+            main.title.fontface = "bold",
+            frame = TRUE,
+            legend.position = c("left", "top"),
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.8,
+            legend.title.size = 0.8,
+            legend.text.size = 0.7)
+
+# 4. RENDER SIDE-BY-SIDE
+# 1. Create the arranged map object
+final_comparison <- tmap_arrange(map_roman, map_income, ncol = 2)
+
+# 2. Save it
+tmap_save(tm = final_comparison, 
+          filename = "imgs/Roman_vs_Income_Comparison.png", 
+          width = 10,       # Wider because it's side-by-side (2 maps)
+          height = 9,       # Tall enough for England
+          units = "in", 
+          dpi = 600)
+
+```
+
+
+## First regression Model
+
+### But first some vis
+```{r}
+library(ggplot2)
+library(patchwork) # For combining plots
+
+# 1. Histogram: Is it a Bell Curve?
+p1 <- ggplot(msoas_with_income, aes(x = total_income)) +
+  geom_histogram(fill = "purple", color = "white", bins = 50) +
+  geom_vline(aes(xintercept = mean(total_income, na.rm = TRUE)), 
+             color = "black", linetype = "dashed", size = 1) +
+  labs(title = "Distribution of Income",
+       subtitle = "Dashed line = Mean Income",
+       x = "Total Annual Income (£)", y = "Count") +
+  theme_minimal()
+
+# 2. Boxplot: Are there massive outliers?
+p2 <- ggplot(msoas_with_income, aes(x = total_income, y = "")) +
+  geom_boxplot(fill = "plum", outlier.colour = "red", outlier.shape = 1) +
+  labs(title = " Outlier Check (Boxplot)",
+       x = "Total Annual Income (£)", y = "") +
+  theme_minimal()
+
+# Combine them using patchwork
+p1 / p2
+```
+
+
+## Running the Legacy Model
+
+```{r}
+# 1. Transform the Income Variable (Log-Log Prep)
+msoas_model_ready <- msoas_with_income %>%
+  mutate(log_income = log(total_income)) %>%
+  filter(!is.na(log_income) & !is.na(log_adj_decay_score))
+
+# 2. RUN THE THESIS MODEL
+# Formula: Log(Modern Wealth) ~ Log(Roman Connectivity)
+legacy_model <- lm(log_income ~ log_adj_decay_score, data = msoas_model_ready)
+
+# 3. GET THE NUMBERS
+summary(legacy_model)
+```
+
+```{r}
+library(ggplot2)
+
+# Ensure you use the exact dataset and variables from your successful model
+ggplot(msoas_model_ready, aes(x = log_adj_decay_score, y = log_income)) +
+  # 1. The Data Cloud
+  geom_point(alpha = 0.15, color = "darkslategrey", size = 0.8) + 
+  
+  # 2. The Regression Line
+  geom_smooth(method = "lm", color = "firebrick", linewidth = 1, se = TRUE) +
+  
+  # 3. Victory Labels
+  labs(title = "The Roman Gradient (Final Model)",
+       subtitle = paste("R-Squared: 0.279 | Coefficient: 0.15 | n = 7,264"),
+       x = "Roman Connectivity Score (Log + 1)",
+       y = "Modern Household Income (Log £)") +
+  
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+
+
+some more viz
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. Create 5 "Tiers" of Roman Connectivity (Quintiles)
+viz_data <- msoas_model_ready %>%
+  mutate(roman_tier = ntile(log_adj_decay_score, 5)) %>%
+  mutate(roman_label = factor(roman_tier, 
+                              labels = c("1. Remote", "2. Low", "3. Medium", "4. High", "5. Roman Hub")))
+
+# 2. Plot the Income Distribution for each Tier
+ggplot(viz_data, aes(x = roman_label, y = total_income, fill = roman_label)) +
+  # The Boxplot shows the median and range
+  geom_boxplot(outlier.alpha = 0.1, outlier.color = "gray") +
+  
+  # Add a trend line connecting the medians
+  stat_summary(fun = median, geom = "line", aes(group = 1), color = "firebrick", size = 1) +
+  
+  scale_fill_brewer(palette = "Oranges") +
+  labs(title = "The Roman Premium: Income by Connectivity Tier",
+       subtitle = "Median income rises consistently as you move closer to Roman networks",
+       x = "Roman Connectivity Tier (Quintiles)",
+       y = "Annual Household Income (£)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Mapping the residuals
+
+```{r}
+
+# 1. Extract residuals and add them to your model data frame
+# Make sure 'msoas_model_ready' is the object you used to build 'legacy_model'
+msoas_model_ready$residuals <- residuals(legacy_model)
+
+# 2. Check to see if it's there
+colnames(msoas_model_ready) # You should now see "residuals" at the end
+
+
+# 1. Ensure tmap is in view mode
+tmap_mode("view")
+
+
+
+# 2. Build the multi-layered map
+# Layer 1: The Residuals (The "Error" in our historical model)
+tm_shape(msoas_model_ready %>% st_simplify(dTolerance = 100) # Keeps the shape but removes unnecessary detail
+         ) +
+  tm_polygons("residuals", 
+              palette = "viridis", 
+              title = "Model Residuals",
+              alpha = 0.5, 
+              id = "msoa21nm",
+              popup.vars = c("Residual" = "residuals")) +
+  
+# Layer 2: The Roman Roads (The "Skeleton" of the country)
+tm_shape(roman_roads_uk) +
+  tm_lines(col = "black", 
+           lwd = 1, 
+           alpha = 0.6, 
+           title.col = "Roman Road Network") +
+
+# Layout and Interactivity
+tm_view()
+```
+
+
+```{r}
+# 1. Load the necessary libraries
+library(readxl)
+library(janitor)
+library(dplyr)
+
+# 2. Load the 'scores' sheet
+# We point to the file path and specify the sheet name
+iod_raw <- read_excel("data/iod25.xlsx", sheet = "scores")
+
+# 3. Normalize the column names
+# clean_names() converts everything to snake_case (e.g., "Income Score" -> "income_score")
+# and handles special characters like "(rate)" or "%" automatically.
+iod_scores <- iod_raw %>%
+  clean_names()
+
+# 4. Quick check of the new names
+colnames(iod_scores)
+```
+
+```{r}
+library(readxl)
+library(readr)
+library(janitor)
+
+# 1. Read the Lookup CSV and print columns
+lsoa_lookup <- read_csv("data/lsoa_to_msoa.csv") %>% clean_names()
+print("--- LSOA to MSOA Lookup Columns ---")
+print(colnames(lsoa_lookup))
+
+# 2. Read the Population Excel and print columns
+# Specifying the 'pop_denom' sheet as you requested
+lsoa_pop <- read_excel("data/lsoa_population.xlsx", sheet = "pop_denom") %>% clean_names()
+print("--- Population Data Columns ---")
+print(colnames(lsoa_pop))
+```
+
+
+```{r}
+# 1. Filter Lookup: Keep only the bridge columns
+lsoa_lookup <- lsoa_lookup %>%
+  select(lsoa21cd, msoa21cd)
+
+# 2. Filter Population: Keep the code and the 2022 weight
+lsoa_pop <- lsoa_pop %>%
+  select(lsoa_code_2021, total_population_mid_2022)
+
+# 3. Create the master object by joining your IoD scores to the lookup
+# We use inner_join to ensure we "skip" any LSOA without a match
+iod_complete <- iod_scores %>%
+  inner_join(lsoa_lookup, by = c("lsoa_code_2021" = "lsoa21cd"))
+
+# 4. Finish the master object by joining the population weights
+# We overwrite iod_complete to keep it as the single source of truth
+iod_complete <- iod_complete %>%
+  inner_join(lsoa_pop, by = "lsoa_code_2021")
+
+# 5. Reality Check: Ensure the object is ready for aggregation
+# We need to see 'msoa21cd' and 'total_population_mid_2022'
+colnames(iod_complete)
+```
+
+
+
+```{r}
+# We perform the aggregation on your current object (iod_complete)
+msoa_iod_final <- iod_complete %>%
+  group_by(msoa21cd) %>%
+  summarise(across(contains("score"), 
+                   ~ sum(.x * total_population_mid_2022, na.rm = TRUE) / 
+                     sum(total_population_mid_2022, na.rm = TRUE)))
+
+# Reality Check: Check the row count
+# It should match your msoas_model_ready row count (approx 7264)
+nrow(msoa_iod_final)
+
+# Check the first few rows to ensure the scores look like realistic averages
+head(msoa_iod_final)
+```
+
+# K Means
+
+Preparing the data
+```{r}
+library(sf)
+library(dplyr)
+
+library(sf)
+library(dplyr)
+
+# 1. Calculate the area of each MSOA in your map
+# We use st_area() which returns meters squared, then convert to km2
+msoa_density_lookup <- msoas_model_ready %>%
+  select(msoa21cd, geometry) %>%
+  mutate(area_km2 = as.numeric(st_area(geometry)) / 1000000) %>%
+  st_drop_geometry() # We only need the numbers for now
+
+# 2. Get the Total Population per MSOA from your IOD/LSOA data
+# We sum up the LSOA populations to the MSOA level
+msoa_pop_totals <- iod_complete %>%
+  group_by(msoa21cd) %>%
+  summarise(total_pop = sum(total_population_mid_2022, na.rm = TRUE))
+
+# 3. Join them and calculate Density
+# Result: One row per MSOA with a density value
+msoa_density_lookup <- msoa_density_lookup %>%
+  inner_join(msoa_pop_totals, by = "msoa21cd") %>%
+  mutate(pop_density = total_pop / area_km2)
+
+# Verify the result
+head(msoa_density_lookup)
+```
+
+
+```{r}
+# Join the density we just made with the deprivation scores we aggregated earlier
+urban_clustering_input <- msoa_density_lookup %>%
+  inner_join(msoa_iod_final, by = "msoa21cd")
+
+# Filter down to exactly the 5 columns you requested
+urban_clustering_input <- urban_clustering_input %>%
+  select(
+    msoa21cd, 
+    pop_density, 
+    geographical_barriers_sub_domain_score, 
+    outdoors_sub_domain_score, 
+    wider_barriers_sub_domain_score
+  )
+
+# Verify the count and the column names
+print(paste("Total rows:", nrow(urban_clustering_input)))
+colnames(urban_clustering_input)
+
+
+```
+
+
+running the model
+
+```{r}
+# 1. Scale the 4 numeric variables (excluding the ID)
+scaled_vars <- urban_clustering_input %>%
+  select(-msoa21cd) %>%
+  scale()
+
+# 2. Run K-means with 4 centers
+set.seed(42)
+km_result <- kmeans(scaled_vars, centers = 4, nstart = 25)
+
+# 3. Add the cluster ID back to your input dataframe
+urban_clustering_input$urbanity_cluster <- as.factor(km_result$cluster)
+```
+
+
+
+```{r}
+library(tidyr)
+library(ggplot2)
+
+
+# 1. Pivot the data to "Long" format for plotting
+plot_data <- urban_clustering_input %>%
+  pivot_longer(cols = c(pop_density, contains("score")), 
+               names_to = "variable", 
+               values_to = "value")
+
+# 2. Create the Boxplot
+ggplot(plot_data, aes(x = urbanity_cluster, y = value, fill = urbanity_cluster)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~variable, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Urbanity Cluster Profiles",
+       subtitle = "Comparing Density and IoD Scores across K-means groups",
+       x = "Cluster ID",
+       y = "Value")
+```
+
+
+### Radar plot
+normalization to prepare
+```{r}
+
+library(fmsb)
+library(dplyr)
+
+# 1. Calculate the mean Z-score for each variable per cluster
+# These are our "Centroids"
+df_centroids <- urban_clustering_input %>%
+  # We use the raw numbers but calculate the Z-scores (Scale)
+  # to match your class logic exactly
+  mutate(across(c(pop_density, contains("score")), scale)) %>%
+  group_by(urbanity_cluster) %>%
+  summarise(across(c(pop_density, contains("score")), mean))
+
+# 2. Format for fmsb: it needs a dataframe with specific rows
+radar_df <- as.data.frame(df_centroids[,-1])
+rownames(radar_df) <- paste("Cluster", df_centroids$urbanity_cluster)
+
+# 3. Add Min/Max rows (Since Z-scores usually fall between -3 and 3, 
+# we set these as the chart boundaries)
+radar_df <- rbind(rep(3, 4), rep(-3, 4), radar_df)
+```
+
+generate
+
+```{r}
+# Define colors
+colors_border <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3")
+colors_fill <- scales::alpha(colors_border, 0.2)
+
+# Set margins
+par(mar=c(2, 2, 2, 2))
+
+# Create the Plot
+radarchart(radar_df, 
+           axistype = 1,
+           # Customize the polygon
+           pcol = colors_border, pfcol = colors_fill, plwd = 3, plty = 1,
+           # Customize the grid
+           cglcol = "grey", cglty = 1, axislabcol = "grey", 
+           caxislabels = seq(-3, 3, 1.5), cglwd = 0.8,
+           # Labels
+           vlcex = 0.5, 
+           title = "Cluster Centroid Comparison (Z-Scores)")
+
+# Add a legend
+legend(x=0.9, y=1.0, legend = rownames(radar_df)[-c(1,2)], 
+       bty = "n", pch=20, col=colors_border, cex=1, pt.cex=2)
+```
+
+```{r}
+# Create a sample of 20 MSOAs per cluster for qualitative analysis
+cluster_sample <- urban_clustering_input %>%
+  group_by(urbanity_cluster) %>%
+  slice_sample(n = 20)
+
+# View the sample in a nice table format
+View(cluster_sample)
+```
+
+
+
+try model
+
+```{r}
+library(dplyr)
+library(sf)
+
+# 1. Start with your main model object
+final_regression_data <- msoas_model_ready %>%
+  # Drop geometry to make it a standard dataframe for regression
+  st_drop_geometry() %>%
+  select(msoa21cd, log_income, log_adj_decay_score) %>%
+  
+  # 2. Join the Density (Agglomeration)
+  left_join(msoa_density_lookup %>% select(msoa21cd, pop_density), by = "msoa21cd") %>%
+  
+  # 3. Join the "Deep Determinants" (Education & Health)
+  # These are the "other variables" that prove it's not just "smart people moving to cities"
+  left_join(msoa_iod_final %>% 
+              select(msoa21cd, 
+                     education_score = education_skills_and_training_score, 
+                     health_score = health_deprivation_and_disability_score,
+                     employment_score = employment_score_rate), # Optional but good
+            by = "msoa21cd") %>%
+  na.omit()
+
+# Check what we have
+head(final_regression_data)
+```
+
+
+```{r}
+# The "Distinction" Model
+model_controls <- lm(log_income ~ log_adj_decay_score + 
+                       log(pop_density) +   # Control for Density (Agglomeration)
+                       education_score +    # Control for Skills (Human Capital)
+                       health_score,        # Control for Health
+                     data = final_regression_data)
+
+summary(model_controls)
+```
+
+
+Compare noramalized Beta
+
+
+```{r}
+# Install this package if you don't have it
+install.packages("lm.beta")
+library(lm.beta)
+
+# Calculate the Standardized coefficients
+std_model <- lm.beta(model_controls)
+
+# Print the coefficients
+print(summary(std_model)$coefficients)
+```
+
+
+
+
+Mapping the residuals
+
+```{r}
+library(tmap)
+library(dplyr)
+library(sf)
+
+# 1. Add residuals to the data used in the model
+# We use the 'final_regression_data' object because it matches the model rows exactly
+final_regression_data$model_residuals <- residuals(model_controls)
+
+# 2. Join this back to the Map Geometry
+# We take the ID and the Residual from the data, and join it to the map
+map_residuals <- msoas_model_ready %>%
+  select(msoa21cd) %>% # Start with just the map shapes
+  inner_join(final_regression_data %>% select(msoa21cd, model_residuals), 
+             by = "msoa21cd")
+
+# 3. Create the Map
+tmap_mode("plot")
+
+tm_shape(map_residuals) +
+  tm_polygons("model_residuals",
+              title = "Model Residuals (Log Income)",
+              palette = "RdBu",      # Red-Blue diverging palette
+              midpoint = 0,          # 0 is the center (Perfect prediction)
+              style = "cont",        # Continuous gradient
+              border.alpha = 0,      # Remove borders for cleaner look
+              id = "msoa21cd") +
+  tm_layout(main.title = "Where is the model wrong?")
+```
+
+
+
+```{r}
+library(dplyr)
+library(spdep)
+
+# 1. Create a "Clean Map" that matches your regression data exactly
+# We keep only the MSOAs that are present in 'final_regression_data'
+map_clean <- msoas_model_ready %>%
+  filter(msoa21cd %in% final_regression_data$msoa21cd)
+
+# 2. Re-build the Neighbours & Weights for this clean map
+nb_clean <- poly2nb(map_clean, queen = TRUE)
+lw_clean <- nb2listw(nb_clean, style = "W", zero.policy = TRUE)
+
+# 3. NOW run the Moran's I Test
+# We add 'zero.policy = TRUE' to handle any islands safely
+moran_test <- lm.morantest(model_controls, lw_clean, zero.policy = TRUE)
+print(moran_test)
+
+# 4. Run the Lagrange Multiplier Diagnostics
+# This checks if you need Lag vs Error
+lm_diagnostics <- lm.LMtests(model_controls, lw_clean, test = "all", zero.policy = TRUE)
+summary(lm_diagnostics)
+```
+
+
+
+```{r}
+library(spdep)
+library(dplyr)
+
+# 1. Filter the Map to match the Regression Data exactly
+# We keep only the MSOAs that are present in your 'final_regression_data'
+map_clean <- msoas_model_ready %>%
+  filter(msoa21cd %in% final_regression_data$msoa21cd)
+
+# 2. Re-build the Neighbours & Weights for this clean map
+nb_clean <- poly2nb(map_clean, queen = TRUE)
+lw_clean <- nb2listw(nb_clean, style = "W", zero.policy = TRUE)
+
+# 3. NOW run the Moran's I Test (Verification Step 1)
+# This checks if the errors are clustered
+moran_test <- lm.morantest(model_controls, lw_clean)
+print(moran_test)
+
+# 4. Run the Lagrange Multiplier Diagnostics (Verification Step 2)
+# This tells us if we need a Spatial Error or Spatial Lag model
+lm_diagnostics <- lm.LMtests(model_controls, lw_clean, test = "all")
+summary(lm_diagnostics)
+```
+
+the spatial error model
+
+```{r}
+
+library(spatialreg)
+library(dplyr)
+
+# 1. Safety Step: Ensure Data matches the Map order perfectly
+# We use 'map_clean' because that is what 'lw_clean' was built from
+final_regression_data_sorted <- final_regression_data %>%
+  arrange(factor(msoa21cd, levels = map_clean$msoa21cd))
+
+# 2. Run the Spatial Error Model (SEM)
+# 'errorsarlm' is used because your LM tests pointed to "Error"
+final_spatial_model <- errorsarlm(log_income ~ log_adj_decay_score +
+                                    log(pop_density) +
+                                    education_score +
+                                    health_score,
+                                  data = final_regression_data_sorted,
+                                  listw = lw_clean,
+                                  zero.policy = TRUE) # Crucial: Ignores the "Island" (Region 6531)
+
+# 3. Reveal the Final Results
+summary(final_spatial_model)
+```
+
+
+
+
+verify the new results
+
+```{r}
+library(tmap)
+library(dplyr)
+library(sf)
+
+# 1. Extract the "clean" residuals from the spatial model
+# The model object has them stored as 'residuals'
+final_regression_data_sorted$spatial_residuals <- residuals(final_spatial_model)
+
+# 2. Join back to the map
+# We use 'map_clean' which we know matches the data order
+map_spatial_check <- map_clean %>%
+  select(msoa21cd) %>%
+  mutate(spatial_residuals = final_regression_data_sorted$spatial_residuals)
+
+# 3. Plot the Map
+tmap_mode("plot")
+
+tm_shape(map_spatial_check) +
+  tm_polygons("spatial_residuals",
+              title = "Spatial Model Residuals",
+              palette = "RdBu",      
+              midpoint = 0,          
+              style = "cont",      
+              border.alpha = 0,
+              id = "msoa21cd") +
+  tm_layout(main.title = "Did we fix the clustering?")
+```
+
+Let's check with Moran's I
+
+```{r}
+library(spdep)
+
+# 1. Extract the residuals from the spatial model
+# The model object contains them, but we need to make sure they match the weights
+spatial_residuals <- residuals(final_spatial_model)
+
+# 2. Run Moran's I Test
+# We use the same weights list (lw_clean) as before
+final_moran_test <- moran.test(spatial_residuals, lw_clean, zero.policy = TRUE)
+
+# 3. Print the result
+print(final_moran_test)
+```
+
+
+
+# NEW MODEL
+
+# Trying some different model
+
+```{r}
+library(sf)
+library(dplyr)
+
+# 1. Load the Modern Road Network
+# We assume this shapefile contains the relevant strategic roads (Motorways/A-Roads)
+modern_roads <- st_read("data/major_road_networks/Major_Road_Network_2018_Open_Roads.shp")
+
+# 2. Check and Fix Coordinate Systems (CRITICAL)
+# Both maps must be in British National Grid (EPSG: 27700) to measure meters correctly
+if (st_crs(modern_roads)$epsg != 27700) {
+  modern_roads <- st_transform(modern_roads, 27700)
+}
+
+# Ensure your MSOA map is also 27700 (it likely is, but good to be safe)
+msoas_uk_projected <- st_transform(msoas_uk, 27700)
+
+# 3. Calculate Centroids of your MSOAs
+# We measure from the "center" of the town
+msoa_centroids <- st_centroid(msoas_uk_projected)
+
+
+# 4. Calculate Distance (The Fast Method)
+# Step A: Find the index of the nearest road for each town
+nearest_road_index <- st_nearest_feature(msoa_centroids, modern_roads)
+
+# Step B: Extract those specific road segments
+nearest_road_segments <- modern_roads[nearest_road_index, ]
+
+# Step C: Calculate the distance only between the town and its specific nearest road
+# 'by_element = TRUE' calculates row-by-row, saving massive amounts of RAM
+dist_meters <- st_distance(msoa_centroids, nearest_road_segments, by_element = TRUE)
+
+# 5. Add to your dataset and convert to Kilometers
+msoas_uk$dist_to_motorway_km <- as.numeric(dist_meters) / 1000
+
+# 6. Log Transform it for the model (Gravity variables are usually logged)
+# We add +1 to avoid log(0) if a centroid falls exactly on a road
+msoas_uk$log_dist_motorway <- log(msoas_uk$dist_to_motorway_km + 1)
+
+# Check the result
+summary(msoas_uk$dist_to_motorway_km)
+```
+
+```{r}
+library(tmap)
+
+# 1. Ensure the data is in the right object
+# (Assuming you ran the previous block and 'msoas_uk' has the new column)
+
+# 2. Set to Interactive Mode
+tmap_mode("plot")
+
+# 3. Create the Map
+tm_shape(msoas_uk) +
+  tm_polygons("dist_to_motorway_km",
+              title = "Distance to Major Roads (km)",
+              style = "jenks",      # 'Fisher' breaks are good for skewed distance data
+              palette = "-magma",    # Dark colors = Far away (Rural), Light = Close (Connected)
+              border.alpha = 0,      # Remove borders to see the pattern clearly
+              id = "msoa21nm",       # Shows MSOA Name on hover (if available)
+              popup.vars = c("Distance (km)" = "dist_to_motorway_km")) +
+  tm_layout(main.title = "Modern Connectivity: Distance to Strategic Network")
+```
+```{r}
+library(ggplot2)
+library(tmap)
+library(sf)
+
+# --- 1. HISTOGRAM & SKEWNESS CHECK ---
+# We use ggplot to see the "Long Tail" of rural areas
+p1 <- ggplot(msoas_uk, aes(x = dist_to_motorway_km)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(title = "Histogram: Distance to Major Roads",
+       subtitle = "Notice the heavy right skew (Long tail of rural areas)",
+       x = "Distance (km)", y = "Count of MSOAs") +
+  theme_minimal()
+
+print(p1)
+
+# --- 2. THE SKEW PLOT (Density Comparison) ---
+# This plot compares the Original (Skewed) vs. Log-Transformed (Normal-ish) data
+# This confirms why we need to use 'log()' in the model
+p2 <- ggplot(msoas_uk, aes(x = dist_to_motorway_km)) +
+  geom_density(fill = "red", alpha = 0.3) +
+  labs(title = "Density Plot (The Skew)",
+       subtitle = "Most towns are close to roads (peak on left), but some are very far.",
+       x = "Distance (km)") +
+  theme_minimal()
+
+# Optional: See how Log-transform fixes it
+p3 <- ggplot(msoas_uk, aes(x = log(dist_to_motorway_km + 1))) +
+  geom_density(fill = "green", alpha = 0.3) +
+  labs(title = "Log-Transformed Density",
+       subtitle = "This is the variable that will actually go into your model (Bell curve).",
+       x = "Log(Distance)") +
+  theme_minimal()
+
+print(p2)
+print(p3) # You can compare the Red plot (Bad) vs Green plot (Good)
+
+# --- 3. THE MAP WITH ROADS OVERLAY ---
+tmap_mode("plot")
+
+tm_shape(msoas_uk) +
+  # Layer 1: The MSOAs colored by distance
+  tm_polygons("dist_to_motorway_km",
+              title = "Dist. to Major Road (km)",
+              style = "fisher",
+              palette = "-magma",    # Dark = Far, Light = Close
+              border.alpha = 0,      # No borders for a cleaner look
+              id = "msoa21nm",
+              popup.vars = c("Distance (km)" = "dist_to_motorway_km")) +
+  
+  # Layer 2: The Actual Road Network on top
+  tm_shape(modern_roads) + 
+  tm_lines(col = "black", 
+           lwd = 1.5,                # Line width
+           alpha = 0.5) +            # Slightly transparent
+  
+  tm_layout(main.title = "Verification: Do the light areas follow the black lines?")
+
+```
+Seeing the log transform on a map
+
+```{r}
+library(tmap)
+library(sf)
+
+# 1. Create the Log-Transformed Variable (if you haven't already)
+# We add +1 so that 0km becomes log(1) = 0
+msoas_uk$log_dist_motorway <- log(msoas_uk$dist_to_motorway_km + 1)
+
+# 2. Map it with the Road Overlay
+tmap_mode("plot")
+
+tm_shape(msoas_uk %>% st_simplify(dTolerance = 25)) +
+  # Layer 1: The Log-Transformed Distance
+  tm_polygons("log_dist_motorway",
+              title = "Log Distance to Network",
+              style = "jenks",        # Continuous gradient (smooth colors)
+              palette = "-viridis",  # Dark = Rural (High Log Dist), Yellow = Connected (Low Log Dist)
+              border.alpha = 0,
+              id = "msoa21nm",
+              popup.vars = c("Log Score" = "log_dist_motorway", 
+                             "Real Dist (km)" = "dist_to_motorway_km")) +
+  
+  # Layer 2: The Actual Road Network (Verification)
+  tm_shape(modern_roads) + 
+  tm_lines(col = "white",           # White lines stand out better against Viridis
+           lwd = 0.8, 
+           alpha = 0.2) +
+  
+  tm_layout(main.title = "Visual Check: Log-Distance vs. Real Roads")
+
+```
+
+
+
+# Distance to Charing Cross (London)
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(tmap)
+
+# --- 1. CALCULATE DISTANCE TO LONDON ---
+
+# Define London (Charing Cross) in British National Grid (EPSG: 27700)
+london_point <- st_point(c(530034, 180381)) %>% 
+  st_sfc(crs = 27700) %>% 
+  st_as_sf()
+
+# Calculate Distance from MSOA centroids
+# Ensure msoas_uk is in the correct CRS
+msoas_uk_projected <- st_transform(msoas_uk, 27700)
+msoa_centroids <- st_centroid(msoas_uk_projected)
+
+# Calculate distance in meters, convert to km
+msoas_uk$dist_to_london_km <- as.numeric(st_distance(msoa_centroids, london_point)) / 1000
+
+# Create the Log-Transformed variable (The one for the model)
+msoas_uk$log_dist_london <- log(msoas_uk$dist_to_london_km + 0.0001)
+```
+
+
+```{r}
+# --- 2. CHECK SKEW (HISTOGRAM & DENSITY) ---
+
+# Plot A: Histogram
+p1_lon <- ggplot(msoas_uk, aes(x = dist_to_london_km)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", color = "white") +
+  labs(title = "Histogram: Distance to London",
+       subtitle = "Notice the spread: London is 0, Scotland is >600km",
+       x = "Distance (km)", y = "Count") +
+  theme_minimal()
+
+# Plot B: Density Comparison (Raw vs Log)
+p2_lon <- ggplot(msoas_uk, aes(x = dist_to_london_km)) +
+  geom_density(fill = "red", alpha = 0.3) +
+  labs(title = "Raw Density (Skewed)", x = "Distance (km)") +
+  theme_minimal()
+
+p3_lon <- ggplot(msoas_uk, aes(x = log_dist_london)) +
+  geom_density(fill = "green", alpha = 0.3) +
+  labs(title = "Log-Transformed Density (Normal-ish)", 
+       subtitle = "This shape is much better for regression.",
+       x = "Log(Distance)") +
+  theme_minimal()
+
+# Display plots
+print(p1_lon)
+print(p2_lon)
+print(p3_lon)
+```
+
+
+```{r}
+# --- 3. THE MAP (YOUR STYLE) ---
+
+tmap_mode("plot") # Or "view" if you want interactive
+
+tm_shape(msoas_uk %>% st_simplify(dTolerance = 25)) +
+  # Layer 1: The Log-Transformed Distance to London
+  tm_polygons("log_dist_london",
+              title = "Log Dist to London",
+              style = "jenks",        # Continuous gradient
+              palette = "-viridis",  # Yellow = Close (London), Purple = Far
+              border.alpha = 0,
+              id = "msoa21nm",
+              popup.vars = c("Log Score" = "log_dist_london", 
+                             "Real Dist (km)" = "dist_to_london_km")) +
+  
+  # Layer 2: Modern Roads Overlay (Context)
+  # Keeping this faint helps show scale/geography even on the London map
+  tm_shape(modern_roads) + 
+  tm_lines(col = "white", 
+           lwd = 0.8, 
+           alpha = 0.2) +
+  
+  # Layer 3: Add a star for London so you can see the "Epicenter"
+  tm_shape(london_point) +
+  tm_dots(col = "red", size = 0.5, shape = 21, title = "London") +
+  
+  tm_layout(main.title = "Visual Check: The 'Gravity' of London")
+```
+
+
+the three way map check
+```{r}
+library(tmap)
+
+# Set mode to plot (Static is better for side-by-side comparison than interactive)
+tmap_mode("plot")
+
+# --- MAP 1: DISTANCE TO LONDON (Gravity) ---
+# The "Ripples" map we just made
+m1 <- tm_shape(msoas_uk %>% st_simplify(dTolerance = 100)) +
+  tm_polygons("log_dist_london",
+              title = "1. Gravity (London)",
+              style = "jenks",       # Jenks shows the 'ripples' best
+              n = 5,
+              palette = "-viridis",
+              border.alpha = 0,
+              legend.show = FALSE) + # Hide legend to save space
+  tm_shape(london_point) +
+  tm_dots(col = "red", size = 0.5) + 
+  tm_layout(frame = FALSE, title = "Dist. to London")
+
+# --- MAP 2: ROMAN INDEX (History) ---
+# Overlaying the actual Roman Roads (White lines)
+m2 <- tm_shape(msoas_uk %>% st_simplify(dTolerance = 100)) +
+  tm_polygons("log_adj_decay_score",
+              title = "2. Roman Index",
+              style = "cont",        # Continuous for density
+              palette = "magma",     # Light = High Roman Density
+              border.alpha = 0,
+              legend.show = FALSE) +
+  tm_shape(roman_roads) +            # <--- YOUR ROMAN ROAD SHAPEFILE HERE
+  tm_lines(col = "white", lwd = 0.5, alpha = 0.5) +
+  tm_layout(frame = FALSE, title = "Roman Network")
+
+# --- MAP 3: DISTANCE TO MOTORWAY (Modern) ---
+# Overlaying the Modern Roads (Black lines for contrast or White)
+m3 <- tm_shape(msoas_uk %>% st_simplify(dTolerance = 100)) +
+  tm_polygons("log_dist_motorway",
+              title = "3. Modern Access",
+              style = "cont",
+              palette = "-viridis",  # Dark = Rural, Light = Connected
+              border.alpha = 0,
+              legend.show = FALSE) +
+  tm_shape(modern_roads) +           # <--- YOUR MODERN ROAD SHAPEFILE
+  tm_lines(col = "white", lwd = 0.5, alpha = 0.3) +
+  tm_layout(frame = FALSE, title = "Modern Network")
+
+# --- ARRANGE THEM SIDE BY SIDE ---
+tmap_arrange(m1, m2, m3, ncol = 3)
+```
+
+
+
+check some correlation
+
+```{r}
+library(dplyr)
+library(sf)
+
+# 1. Join the new variables to your final regression dataset
+# We join by MSOA Code (msoa21cd) to ensure the rows match perfectly
+final_data_with_dist <- final_regression_data_sorted %>%
+  left_join(msoas_uk %>% st_drop_geometry() %>% select(msoa21cd, log_dist_london, log_dist_motorway), 
+            by = "msoa21cd")
+
+# 2. Select just the 3 contenders
+correlation_data <- final_data_with_dist %>%
+  st_drop_geometry() %>%
+  select(log_adj_decay_score,    # The Hero (Roman)
+         log_dist_london,        # The Rival 1 (Gravity)
+         log_dist_motorway)      # The Rival 2 (Modern Access)
+
+# 3. Run the Test
+cor_matrix <- cor(correlation_data, use = "complete.obs")
+
+# Print it nicely
+print(round(cor_matrix, 2))
+```
+
+
+
+```{r}
+library(janitor)
+library(dplyr)
+library(readr)
+
+# 1. Load the data
+# Adjust the path if necessary
+hours_data <- read_csv("data/census2021-hours-worked-msoa.csv")
+
+# 2. Clean the column names
+hours_data_clean <- hours_data %>% 
+  clean_names()
+
+# 3. Print the cleaned names
+print(colnames(hours_data_clean))
+```
+
+
+```{r}
+library(janitor)
+library(dplyr)
+library(spatialreg)
+
+# 1. LOAD & CLEAN
+hours_raw <- read_csv("data/census2021-hours-worked-msoa.csv", show_col_types = FALSE) %>%
+  clean_names()
+
+# 2. CREATE THE VARIABLE (Percentage working 49+ hours)
+hours_clean <- hours_raw %>%
+  mutate(
+    # Calculate % (Multiply by 100 for readability, or keep as 0-1 decimal)
+    # We use 0-1 decimal to match other vars usually, but let's stick to what fits your data.
+    # Let's use 0-100% to make the coefficient easier to read.
+    pct_long_hours = (hours_worked_full_time_49_or_more_hours_worked / 
+                      hours_worked_total_all_usual_residents_aged_16_years_and_over_in_employment_the_week_before_the_census) * 100
+  ) %>%
+  # Select only what we need to join
+  select(msoa21cd = geography_code, pct_long_hours)
+
+# 3. JOIN TO YOUR MAIN DATA (The "Robust" Dataset)
+# We join this to the dataset that already has the Distance variables
+final_data_complete <- final_data_with_dist %>%
+  left_join(hours_clean, by = "msoa21cd")
+
+```
+
+
+```{r}
+head(final_data_complete)
+```
+
+
+```{r}
+library(ggplot2)
+library(tmap)
+library(sf)
+library(dplyr)
+
+# 1. Join the new variable to the Map Object (msoas_uk)
+# We assume 'hours_clean' was created in the previous step
+msoas_map_data <- msoas_uk %>%
+  left_join(hours_clean, by = c("msoa21cd" = "msoa21cd"))
+
+# --- VISUAL 1: HISTOGRAM ---
+# Check the spread. Is it a Bell Curve? Or skewed?
+p1_work <- ggplot(msoas_map_data, aes(x = pct_long_hours)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+  labs(title = "Histogram: % Working Long Hours (49+)",
+       subtitle = "Most places have 10-15% overwork. Where are the 30%+ areas?",
+       x = "Percentage (%)", y = "Count of MSOAs") +
+  theme_minimal()
+
+# --- VISUAL 2: DENSITY (SKEW CHECK) ---
+# Percentages usually don't need Log-transforming, but let's check.
+p2_work <- ggplot(msoas_map_data, aes(x = pct_long_hours)) +
+  geom_density(fill = "orange", alpha = 0.5) +
+  labs(title = "Density Plot: Is the data skewed?",
+       subtitle = "If this looks roughly like a bell curve, we DON'T need to log it.",
+       x = "Percentage (%)") +
+  theme_minimal()
+
+print(p1_work)
+print(p2_work)
+
+# --- VISUAL 3: THE MAP ---
+# This will show us WHERE the hard workers live.
+tmap_mode("view")
+
+tm_shape(msoas_map_data %>% st_simplify(dTolerance = 50)) +
+  tm_polygons("pct_long_hours",
+              title = "% Working 49+ Hours",
+              style = "jenks",
+              n = 6,
+              palette = "Reds",      # Red = High Overwork (Danger Zone)
+              border.alpha = 0,
+              alpha = 0.3,
+              id = "msoa21nm") +
+
+  
+  tm_layout(main.title = "Geography of Overwork")
+```
+
+
+```{r}
+library(dplyr)
+library(car)      # For VIF
+library(janitor)
+
+# 1. FINAL DATA MERGE (Just to be safe)
+# We ensure all 3 new variables are in the same place
+final_data_boss <- final_regression_data_sorted %>%
+  # Join Distance variables
+  left_join(msoas_uk %>% st_drop_geometry() %>% select(msoa21cd, log_dist_london, log_dist_motorway), 
+            by = "msoa21cd") %>%
+  # Join Work Hours variable
+  left_join(hours_clean, by = "msoa21cd")
+
+# 2. RUN THE OLS MODEL
+boss_model_ols <- lm(log_income ~ log_adj_decay_score +    # The Hero
+                                  log(pop_density) +       # Agglomeration
+                                  education_score +        # Human Capital
+                                  health_score +           # Health
+                                  log_dist_motorway +      # Modern Access (Mediator)
+                                  log_dist_london +        # Gravity (Confounder)
+                                  pct_long_hours,          # Work Ethic
+                     data = final_data_boss)
+
+# 3. PRINT THE RESULTS
+print("--- THE VERDICT ---")
+summary(boss_model_ols)
+
+# 4. CHECK MULTICOLLINEARITY (The Safety Check)
+print("--- VIF SCORES (Are variables fighting?) ---")
+vif(boss_model_ols)
+```
+
+Lagrange on global
+```{r}
+# 4. Run the Lagrange Multiplier Diagnostics
+# This checks if you need Lag vs Error
+lm_diagnostics_boss_ols <- lm.LMtests(boss_model_ols, lw_clean, test = "all", zero.policy = TRUE)
+summary(lm_diagnostics_boss_ols)
+```
+
+
+spatial err boss
+
+```{r}
+library(spatialreg)
+
+# 1. DEFINE THE FORMULA
+# (Identical to your OLS, but now fed into the spatial engine)
+final_formula <- log_income ~ log_adj_decay_score +    # History
+                              log(pop_density) +       # Density
+                              education_score +        # Skills
+                              health_score +           # Health
+                              log_dist_motorway +      # Modern Access
+                              log_dist_london +        # Gravity
+                              pct_long_hours           # Work Ethic
+
+# 2. RUN THE SPATIAL ERROR MODEL
+# Note: This might take 30-60 seconds to run because of the complexity
+final_spatial_model <- errorsarlm(final_formula, 
+                                  data = final_data_boss, 
+                                  listw = lw_clean,    # Your spatial weights matrix
+                                  zero.policy = TRUE,
+                                  method = "LU")       # Fast calculation method
+
+# 3. PRINT THE RESULTS
+summary(final_spatial_model)
+```
+
+
+# GWR MODEL
+```{r}
+library(spgwr)
+library(sf)
+library(tmap)
+
+# 1. FIX THE DATA (Re-attach Geometry)
+# We join your regression data back to the map shapes to ensure it has geometry
+gwr_data_sf <- msoas_uk %>%
+  select(msoa21cd) %>%
+  left_join(final_data_boss, by = "msoa21cd") %>%
+  # Filter out missing data (GWR hates NAs)
+  filter(!is.na(log_income), 
+         !is.na(log_adj_decay_score),
+         !is.na(log_dist_london)) 
+
+# 2. CONVERT TO "SPATIAL" (The format GWR needs)
+gwr_data_sp <- as(gwr_data_sf, "Spatial")
+
+# 3. CALCULATE BANDWIDTH (This finds the 'Window Size')
+# NOTE: This step might take 2-5 minutes. Don't worry if it pauses.
+print("Calculating optimal bandwidth...")
+bw_optimal <- gwr.sel(log_income ~ log_adj_decay_score + 
+                        log(pop_density) + 
+                        education_score + 
+                        health_score + 
+                        log_dist_motorway + 
+                        log_dist_london + 
+                        pct_long_hours, 
+                      data = gwr_data_sp, 
+                      adapt = TRUE)
+
+print(paste("Optimal Bandwidth (Proportion of neighbors):", round(bw_optimal, 4)))
+
+# 4. RUN THE GWR MODEL
+print("Running GWR Model...")
+gwr_model <- gwr(log_income ~ log_adj_decay_score +
+                   log(pop_density) +
+                   education_score +
+                   health_score +
+                   log_dist_motorway +
+                   log_dist_london +
+                   pct_long_hours,
+                 data = gwr_data_sp,
+                 adapt = bw_optimal,
+                 hatmatrix = TRUE,
+                 se.fit = TRUE)
+
+# 5. VISUALIZE THE RESULTS
+# Convert results back to SF for mapping
+results_sf <- st_as_sf(gwr_model$SDF)
+
+```
+
+
+
+
+```{r}
+gwr_results_sf_simplified <-
+  results_sf %>% st_simplify(dTolerance = 500)
+```
+
+
+```{r}
+# jtt
+# 1. Extract Roman Centrality coefficients
+roman_coef <- results_sf$log_adj_decay_score
+
+# Summary statistics
+summary(roman_coef)
+sd(roman_coef)
+
+# 2. Local R²
+local_r2 <- results_sf$localR2
+
+# Summary statistics
+summary(local_r2)
+sd(local_r2)
+
+# 3. Count areas where Roman effect is positive vs negative
+table(sign(roman_coef))
+
+# 4. Optional: map the Roman coefficient (for visualization)
+library(ggplot2)
+ggplot(results_sf) +
+  geom_sf(aes(fill = log_adj_decay_score)) +
+  scale_fill_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "GWR Roman Centrality Coefficient Across MSOAs")
+
+```
+
+
+```{r}
+library(ggplot2)
+library(ggplot2)
+
+ggplot(results_sf, aes(x = "United Kingdom", y = localR2)) +
+  # CHANGE 1: Set 'width' to 0.5 (or lower) to make the shape skinnier
+  geom_violin(fill = "#4682B4", color = "transparent", alpha = 0.3, width = 0.5) +
+  
+  # CHANGE 2: Reduce boxplot width slightly to match the new violin size
+  geom_boxplot(width = 0.05, fill = "white", color = "black", outlier.shape = NA) +
+  
+  labs(title = "Local R-Squared Distribution",
+       subtitle = "Variation across all MSOAs",
+       y = "Adjusted Local R-Squared",
+       x = "") +
+  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_blank(), 
+    panel.grid.major.x = element_blank(),
+    # CHANGE 3: Force the plot to be taller (Portrait mode)
+    aspect.ratio = 1.5
+  )
+```
+
+
+```{r}
+# 1. Check the range to confirm the crazy numbers
+summary(results_sf$log_adj_decay_score) # or log_adj_decay_score
+
+
+library(ggplot2)
+
+# 1. Sort the data from lowest to highest coefficient
+results_sf$rank_roman <- rank(results_sf$log_adj_decay_score)
+
+# 2. Create the Index Plot
+ggplot(results_sf, aes(x = rank_roman, y = log_adj_decay_score)) +
+  # Use points to show the data
+  geom_point(color = "steelblue", alpha = 0.5, size = 0.5) +
+  
+  # Add the Zero line
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  
+  # Annotate the "Cliff" (The outliers)
+  annotate("text", x = 500, y = -50, label = "Outliers", 
+           color = "red", size = 3, fontface = "italic") +
+  
+  # Labels
+  labs(title = "Rank-size Distribution of Roman Effects",
+       subtitle = "Ordered coefficients for all MSOAs",
+       x = "MSOA Rank (Ordered by Coefficient Size)",
+       y = "Coefficient Value") +
+  
+  theme_minimal()
+```
+
+
+```{r}
+# staying with sig woth jtt
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# 1. Compute t-values for Roman Centrality
+results_sf$t_roman <- results_sf$log_adj_decay_score / results_sf$log_adj_decay_score_se
+
+# 2. Filter only significant coefficients (|t| > 1.96)
+results_sig <- results_sf %>% filter(abs(t_roman) > 1.96)
+
+# 3. Filter out extreme values using percentiles (1st-99th)
+coef_lower <- quantile(results_sig$log_adj_decay_score, 0.05)
+coef_upper <- quantile(results_sig$log_adj_decay_score, 0.95)
+results_sig_clean <- results_sig %>%
+  filter(log_adj_decay_score >= coef_lower & log_adj_decay_score <= coef_upper)
+
+# 4. Summary statistics of filtered & cleaned coefficients
+roman_coef_clean <- results_sig_clean$log_adj_decay_score
+summary(roman_coef_clean)
+sd(roman_coef_clean)
+table(sign(roman_coef_clean))  # positive vs negative
+
+# 5. Optional: summary of local R² for cleaned areas
+summary(results_sig_clean$localR2)
+sd(results_sig_clean$localR2)
+
+# 6. Map the cleaned coefficients
+ggplot(results_sig_clean) +
+  geom_sf(aes(fill = log_adj_decay_score)) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey50") +
+  theme_minimal() +
+  labs(
+    title = "GWR: Significant Roman Centrality Coefficients (Filtered for Extremes)",
+    fill = "Roman Coef"
+  )
+
+
+
+```
+
+
+
+
+
+```{r}
+
+# Map: Where is the Roman Effect Strongest?
+tmap_mode("plot")
+tm_shape(gwr_results_sf_simplified) +
+  tm_polygons("log_adj_decay_score",
+              title = "Local Roman Effect (Coefficient)",
+              style = "jenks",      # Highlights the extremes
+              palette = "PRGn",
+              midpoint = 0,
+              alpha = 1,
+              border.alpha = 0.02,
+              popup.vars = c("Roman Effect" = "log_adj_decay_score", 
+                             "Significance (t)" = "log_adj_decay_score_se")) +
+  tm_layout(title = "Where History Matters: Local Roman Beta Coefficients")   + 
+
+# Layer 2: The Roman Roads (The Black Skeleton)
+tm_shape(roman_roads_uk) +
+  tm_lines(col = "black",
+           lwd = 0.5,              # Thicker lines to make them stand out
+           alpha = 0.3,          # Dark and visible
+           popup.vars = c("Road Name" = "Name"))
+```
+
+```{r}
+
+
+
+# Get the summary of the GWR results
+results_summary <- summary(gwr_model$SDF)
+
+
+  
+print("--- COMPARE THE POWER ---")
+# 1. Look at Roman Roads (Your Map)
+print("Range of Roman Coefficients (Min to Max):")
+print(summary(results_sf$log_adj_decay_score))
+
+
+
+# 2. Look at Education (The Big Fish)
+print("Range of Education Coefficients (Min to Max):")
+print(summary(results_sf$education_score))
+```
+
+
+```{r}
+# # 1. VISUAL FIX: Create the "England Only" Road Network
+# # We use st_intersection to cut the roads exactly at the border of your data.
+# # (This acts like a cookie cutter)
+# 
+# print("Clipping Roman Roads to England boundary...")
+# # We unify the MSOAs to create one single "England" shape for cleaner cutting
+# england_outline <- st_union(gwr_results_sf_simplified) 
+# 
+# # Perform the cut
+# roman_roads_england <- st_intersection(roman_roads_uk, england_outline)
+```
+
+
+```{r}
+library(tmap)
+
+# 1. Define the Breaks to handle the outliers
+# Anything below -0.15 or above 0.15 is treated as an "Extreme/Outlier"
+# The middle zone (-0.05 to 0.05) is "Weak/Neutral"
+my_breaks <- c(-100, -0.15, -0.05, 0, 0.05, 0.15, 100)
+
+# 2. Define Clean Labels for the Legend
+my_labels <- c("Outlier (< -15%)", 
+               "Strong Negative", 
+               "Weak Negative", 
+               "Weak Positive", 
+               "Strong Positive", 
+               "Outlier (> +15%)")
+
+# 3. Plot the Map
+tmap_mode("plot")
+
+tm_shape(gwr_results_sf_simplified) +
+  tm_polygons("log_adj_decay_score",
+              title = "Local Roman Effect\n(Elasticity)",
+              style = "fixed",          # CHANGED: Fixed breaks to handle outliers
+              breaks = my_breaks,
+              labels = my_labels,       # CHANGED: Custom labels
+              palette = "PRGn",         # Purple (Neg) to Green (Pos)
+              midpoint = 0,
+              alpha = 1,
+              border.alpha = 0.0,       # No borders for cleaner look
+              colorNA = "grey90",       # Missing values are grey
+              popup.vars = c("Roman Effect" = "log_adj_decay_score")) +
+
+  # Layer 2: The Roman Roads (The Black Skeleton)
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", 
+           lwd = 0.8,                   # Slightly thicker than 0.5 for visibility
+           alpha = 0.4) +               # Semi-transparent
+  
+  # Layout settings
+  tm_layout(main.title = "Where History Matters: Local Roman Coefficients",
+            main.title.size = 1.1,
+            # legend.position = c("right", "top"),
+            legend.outside.position = "right",
+            legend.outside = TRUE,
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.8,
+            frame = FALSE)
+```
+
+
+or other approach
+
+```{r}
+# Check the range of the coefficients (The "Roman Effect")
+summary(gwr_results_sf_simplified$log_adj_decay_score)
+
+# Check the t-values (Significance)
+# Note: You need to calculate t-values if they aren't there
+# t = coefficient / standard_error
+gwr_results_sf_simplified$t_value <- gwr_results_sf_simplified$log_adj_decay_score / 
+                                     gwr_results_sf_simplified$log_adj_decay_score_se
+
+summary(gwr_results_sf_simplified$t_value)
+```
+
+
+```{r}
+# library(tmap)
+# library(dplyr)
+# 
+# 
+# 
+# library(dplyr)
+# library(sf)
+# 
+# # Step 1: Compute t-values
+# sig_map_data <- gwr_results_sf_simplified %>%
+#   mutate(
+#     t_val = log_adj_decay_score / log_adj_decay_score_se
+#   )
+# 
+# # Step 2: Filter "actually Roman" areas (raw Roman score > 25th percentile)
+# threshold <- quantile(gwr_data_sf$log_adj_decay_score, 0.5, na.rm = TRUE)
+# sig_map_data <- sig_map_data %>%
+#   left_join(
+#     st_drop_geometry(gwr_data_sf) %>% select(msoa21cd, raw_roman_score = log_adj_decay_score),
+#     by = "msoa21cd"
+#   )
+# 
+# # Step 3: Keep only significant & historically Roman areas
+# sig_map_data <- sig_map_data %>%
+#   mutate(
+#     coef_sig = ifelse(
+#       abs(t_val) > 1.96 &        # significant
+#       raw_roman_score > threshold, # actually Roman
+#       log_adj_decay_score,
+#       NA
+#     )
+#   )
+# 
+# 
+# # sig_map_data <- gwr_results_sf_simplified %>%
+# #   mutate(
+# #     # Calculate t-stat if missing
+# #     t_val = log_adj_decay_score / log_adj_decay_score_se,
+# #     
+# #     # Create a "Clean" coefficient column: 
+# #     # If t-value is between -1.96 and 1.96, set to NA (Grey).
+# #     # Also filter out the crazy Cornwall outliers (> 5 or < -5)
+# #     coef_sig = ifelse(abs(t_val) > 1.96 & abs(log_adj_decay_score) < 5, 
+# #                       log_adj_decay_score, 
+# #                       NA)
+# #   )
+# 
+# # 2. PLOT THE "TRUTH MAP"
+# tmap_mode("plot")
+# 
+# tm_shape(sig_map_data %>% st_simplify(dTolerance = 100)) +
+#   tm_polygons("coef_sig",
+#               title = "Significant Roman Effect\n(Local Coefficient)",
+#               style = "fisher",       # "fisher" finds the best natural groups automatically
+#               palette = "PRGn",       # Purple (Neg) -> White -> Green (Pos)
+#               midpoint = 0,           # Ensures 0 is White
+#               colorNA = "grey90",     # Insignificant areas are Grey
+#               textNA = "Not Significant",
+#               border.alpha = 0,
+#               popup.vars = c("Coefficient" = "log_adj_decay_score", "t-value" = "t_val")) +
+#   
+#   # Add Roads for Context
+#   tm_shape(roman_roads_england) +
+#   tm_lines(col = "black", lwd = 0.7, alpha = 0.4) +
+#   
+#   # Layout settings
+#   tm_layout(main.title = "Where History Matters: Local Roman Coefficients",
+#             main.title.size = 1.5,
+#             # legend.position = c("right", "top"),
+#             legend.outside.position = "right",
+#             legend.outside = TRUE,
+#             legend.bg.color = "white",
+#             legend.bg.alpha = 0.8,
+#             frame = FALSE)
+```
+
+
+```{r}
+### 2 side-by-side with london area
+library(dplyr)
+library(sf)
+library(tmap)
+library(classInt) # Required for manual breaks
+
+results_sf$msoa21cd <- gwr_data_sf$msoa21cd
+
+
+# --- DATA PREP (Your Code) ---
+# 1. Compute t-values
+sig_map_data <- results_sf %>%
+  mutate(t_val = log_adj_decay_score / log_adj_decay_score_se)
+
+# 2. Filter "actually Roman" (Thresholding)
+threshold <- quantile(gwr_data_sf$log_adj_decay_score, 0.5, na.rm = TRUE)
+sig_map_data <- sig_map_data %>%
+  left_join(st_drop_geometry(gwr_data_sf) %>% select(msoa21cd, raw_roman_score = log_adj_decay_score),
+            by = "msoa21cd")
+
+# 3. Keep only significant & historically Roman areas
+sig_map_data <- sig_map_data %>%
+  mutate(
+    coef_sig = ifelse(
+      abs(t_val) > 1.96 & raw_roman_score > threshold, 
+      log_adj_decay_score, 
+      NA
+    )
+  )
+
+# --- VISUALIZATION PREP ---
+
+# A. Define Common Breaks (CRITICAL STEP)
+# We calculate the breaks *once* on the full dataset so both maps share the scale.
+# "fisher" style finds natural clusters in the data.
+my_breaks <- classIntervals(sig_map_data$coef_sig[!is.na(sig_map_data$coef_sig)], 
+                            n = 5, style = "fisher")$brks
+
+# B. Define a Bounding Box for London
+# (Approximate British National Grid coordinates for Greater London)
+london_bbox <- st_bbox(c(xmin = 503000, xmax = 561000, 
+                         ymin = 155000, ymax = 201000), 
+                       crs = st_crs(sig_map_data))
+
+# --- MAP 1: ENGLAND (The Overview) ---
+map_england <- tm_shape(sig_map_data %>% st_simplify(dTolerance = 100)) +
+  tm_polygons("coef_sig",
+              title = "Significant Roman Effect\n(Local Coefficient)",
+              breaks = my_breaks,      # <--- USE COMMON BREAKS
+              palette = "PRGn",
+              midpoint = 0,
+              colorNA = "grey92",      # Lighter grey for better contrast
+              textNA = "Not Significant",
+              border.alpha = 0) +
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.5, alpha = 0.3) +
+  tm_layout(main.title = "A. National View",
+            main.title.size = 1.2,
+            frame = FALSE,
+            legend.position = c("left", "bottom")) # Legend on this map
+
+# --- MAP 2: LONDON ZOOM (The Detail) ---
+map_london <- tm_shape(sig_map_data) + # No simplify for London (keep detail)
+  tm_polygons("coef_sig",
+              breaks = my_breaks,      # <--- USE SAME COMMON BREAKS
+              palette = "PRGn",
+              midpoint = 0,
+              colorNA = "grey92",
+              border.alpha = 0.1,      # Slight border to see neighborhoods
+              legend.show = FALSE) +   # HIDE LEGEND (Shared with Map 1)
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 1, alpha = 0.5) + # Thicker roads for zoom
+  tm_layout(main.title = "B. London & The 'Spine'",
+            main.title.size = 1.2,
+            frame = FALSE) +
+  tm_view(bbox = london_bbox) # Force the zoom
+
+# --- COMBINE THEM ---
+tmap_mode("plot")
+tmap_arrange(map_england, map_london, ncol = 2)
+```
+
+
+another try
+```{r}
+library(dplyr)
+library(sf)
+library(tmap)
+library(classInt)
+library(maptiles) # <--- NEW PACKAGE for stable map tiles
+library(terra)    # <--- NEW PACKAGE to handle the image
+
+# --- REPAIR STEP: GET NAMES ---
+sig_map_data <- sig_map_data %>%
+  left_join(st_drop_geometry(msoas_uk) %>% select(msoa21cd, msoa21nm), 
+            by = "msoa21cd")
+
+# --- PREP 1: DEFINE LONDON BOX ---
+london_bbox_obj <- st_bbox(c(xmin = 500000, xmax = 563000, 
+                             ymin = 150000, ymax = 221000), 
+                           crs = st_crs(sig_map_data))
+
+# --- PREP 2: FETCH BACKGROUND (The Fix) ---
+# We use 'get_tiles' instead of 'read_osm'.
+# provider = "CartoDB.Positron" is the modern name for 'CartoLight'
+london_bg <- get_tiles(x = london_bbox_obj, 
+                       provider = "CartoDB.Positron", 
+                       zoom = 12,    # Zoom 12 is perfect for city view
+                       crop = TRUE)
+
+# --- PREP 3: FIX ROADS ---
+london_roads_clean <- st_crop(roman_roads_england, london_bbox_obj)
+
+# --- VISUALIZATION ---
+
+# Define Common Breaks
+my_breaks <- classIntervals(sig_map_data$coef_sig[!is.na(sig_map_data$coef_sig)], 
+                            n = 5, style = "fisher")$brks
+
+# MAP 1: ENGLAND (Overview)
+map_england <- tm_shape(sig_map_data %>% st_simplify(dTolerance = 100)) +
+  tm_polygons("coef_sig",
+              title = "Significant Roman Effect\n(Local Coefficient)",
+              breaks = my_breaks,
+              palette = "PRGn",
+              midpoint = 0,
+              colorNA = "grey92",
+              textNA = "Not Significant",
+              border.alpha = 0) +
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.5, alpha = 0.3) +
+  tm_layout(main.title = "National View",
+            main.title.size = 1.1,
+            frame = FALSE,
+            legend.position = c("left", "bottom"))
+
+# MAP 2: LONDON (With 'maptiles' Background)
+map_london <- tm_shape(london_bg) +   # <--- LAYER 1: The Raster Background
+  tm_rgb() +                          # <--- Function to plot the image
+  
+  tm_shape(sig_map_data, bbox = london_bbox_obj) + 
+  # LAYER 2: The Data (Semi-transparent)
+  tm_polygons("coef_sig",
+              breaks = my_breaks,
+              palette = "PRGn",
+              midpoint = 0,
+              colorNA = "grey92",    # Dark grey for insignificant areas
+              alpha = 0.6,           # 60% opacity to let the map show through
+              border.alpha = 0,
+              legend.show = FALSE) +
+  
+  # LAYER 3: The Roman Roads
+  tm_shape(london_roads_clean) +
+  tm_lines(col = "black", lwd = 1.5) + # Bold black lines
+  
+  # Layout
+  tm_layout(main.title = "London",
+            main.title.size = 1.1,
+            frame = FALSE)
+
+# --- COMBINE ---
+tmap_mode("plot")
+tmap_arrange(map_england, map_london, ncol = 2)
+
+```
+
+all eng VIEW
+
+```{r}
+library(dplyr)
+library(sf)
+library(tmap)
+library(classInt)
+
+# --- STEP 1: PREP & SIMPLIFY ---
+# We create a specific 'lightweight' version for the national map.
+# dTolerance = 200 means details smaller than 200m are smoothed out.
+england_simple <- sig_map_data %>%
+  st_simplify(dTolerance = 200)
+
+# --- STEP 2: DEFINE COMMON BREAKS ---
+# Critical: Use the exact same logic as your local maps so colors match
+my_breaks <- classIntervals(sig_map_data$coef_sig[!is.na(sig_map_data$coef_sig)], 
+                            n = 5, style = "fisher")$brks
+
+# --- STEP 3: VISUALIZATION ---
+tmap_mode("view") # Static mode for high-quality export
+
+tm_shape(england_simple) +
+  tm_polygons("coef_sig",
+              title = "Significant Roman Effect\n(Local Coefficient)",
+              breaks = my_breaks,
+              palette = "plasma",         # Purple (Neg) <-> Green (Pos)
+              midpoint = 0,             # White is zero
+              colorNA = "grey92",       # Light grey for insignificant/missing
+              textNA = "Not Significant",
+              border.alpha = 0,         # No borders (looks cleaner on national map)
+              lwd = 0) +
+  
+  # Add Roman Roads (Thin and faint for context)
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.3, alpha = 0.6) +
+  
+  # Layout settings
+  tm_layout(main.title = "Where History Matters: National GWR Roman Beta Coefficients",
+            main.title.position = "center",
+            main.title.size = 1,
+            legend.position = c("left", "bottom"),
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.8,
+            frame = FALSE)
+```
+
+Brighton, Leicester
+```{r}
+library(dplyr)
+library(sf)
+library(tmap)
+library(classInt)
+library(maptiles)
+library(terra)
+
+# --- 1. PREP & REPAIR ---
+if(!"msoa21nm" %in% names(sig_map_data)) {
+  sig_map_data <- sig_map_data %>%
+    left_join(st_drop_geometry(msoas_uk) %>% select(msoa21cd, msoa21nm), by = "msoa21cd")
+}
+
+# Define Viewing Windows (~65km wide)
+bbox_brighton <- st_bbox(c(xmin = 498000, xmax = 563000, ymin = 85000,  ymax = 150000), crs = st_crs(sig_map_data))
+bbox_leicester <- st_bbox(c(xmin = 425000, xmax = 490000, ymin = 270000, ymax = 335000), crs = st_crs(sig_map_data))
+
+# --- 2. COOKIE CUTTER FIX ---
+poly_brighton <- st_as_sfc(bbox_brighton)
+poly_leicester <- st_as_sfc(bbox_leicester)
+
+data_brighton <- st_intersection(sig_map_data, poly_brighton)
+data_leicester <- st_intersection(sig_map_data, poly_leicester)
+
+roads_brighton <- st_intersection(roman_roads_england, poly_brighton) %>% st_union() %>% st_line_merge()
+roads_leicester <- st_intersection(roman_roads_england, poly_leicester) %>% st_union() %>% st_line_merge()
+
+# --- 3. BACKGROUNDS ---
+bg_brighton  <- get_tiles(bbox_brighton,  provider = "CartoDB.PositronNoLabels", zoom = 10, crop = TRUE)
+bg_leicester <- get_tiles(bbox_leicester, provider = "CartoDB.PositronNoLabels", zoom = 10, crop = TRUE)
+
+# --- 4. LABELS ---
+label_df <- data.frame(
+  label = c("BRIGHTON", "LEICESTER"),
+  x = c(531000, 458700), y = c(104500, 304300), city = c("Brighton", "Leicester")
+) %>% st_as_sf(coords = c("x", "y"), crs = st_crs(sig_map_data))
+
+# --- 5. VISUALIZATION ---
+my_breaks <- classIntervals(sig_map_data$coef_sig[!is.na(sig_map_data$coef_sig)], n = 5, style = "fisher")$brks
+
+tmap_mode("plot")
+
+# MAP A: BRIGHTON (No Legend)
+map_brighton <- tm_shape(bg_brighton) + tm_rgb() +
+  tm_shape(data_brighton) +
+  tm_polygons("coef_sig", 
+              breaks = my_breaks, 
+              palette = "plasma", 
+              midpoint = NA,
+              colorNA = "grey", alpha = 0.7, border.alpha = 0,
+              textNA = "Insignificant",
+              legend.show = FALSE) +  # <--- HIDE LEGEND
+  
+  tm_shape(roads_brighton) + tm_lines(col = "black", lwd = 1.2) +
+  
+  tm_shape(label_df %>% filter(city == "Brighton")) +
+  tm_text("label", size = 0.7, fontface = "bold", col = "black", shadow = TRUE, bg.color = "white", bg.alpha = 0.5) +
+  
+  tm_layout(main.title = "The Commuter Spine (Brighton)", 
+            main.title.size = 0.9, 
+            frame = FALSE)
+
+# MAP B: LEICESTER (With Legend + Caption)
+map_leicester <- tm_shape(bg_leicester) + tm_rgb() +
+  tm_shape(data_leicester) +
+  tm_polygons("coef_sig", 
+              title = "Roman Effect",
+              breaks = my_breaks, 
+              palette = "plasma", 
+              midpoint = NA,
+              colorNA = "grey", alpha = 0.7, border.alpha = 0,
+              textNA = "Insignificant",
+              legend.show = TRUE,         # <--- SHOW LEGEND
+              legend.is.portrait = TRUE) + 
+  
+  tm_shape(roads_leicester) + tm_lines(col = "black", lwd = 1.2) +
+  
+  tm_shape(label_df %>% filter(city == "Leicester")) +
+  tm_text("label", size = 0.7, fontface = "bold", col = "black", shadow = TRUE, bg.color = "white", bg.alpha = 0.5) +
+  
+  # CAPTION CREDIT
+  tm_credits("Black lines = Roman Roads\nSource: Itiner-e Digital Atlas", 
+             position = c("right", "bottom"), 
+             size = 0.5, 
+             bg.color = "white", 
+             bg.alpha = 0.6) +
+
+  tm_layout(main.title = "The Midlands (Leicester)", 
+            main.title.size = 0.9,
+            legend.position = c("left", "bottom"), # <--- INSIDE CORNER
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.6,
+            legend.text.size = 0.5,
+            legend.title.size = 0.7,
+            frame = FALSE)
+
+# --- 6. COMBINE ---
+tmap_arrange(map_brighton, map_leicester, ncol = 2)
+```
+
+ALL eng 
+```{r}
+library(dplyr)
+library(sf)
+library(tmap)
+library(classInt)
+library(maptiles)
+library(terra)
+
+# --- 1. PREP ---
+# Simplify to make it fast
+england_simple <- sig_map_data %>% st_simplify(dTolerance = 100)
+
+# Define a TIGHT bounding box around England/Wales
+# I've manually tweaked these numbers to cut off unnecessary sea/France
+bbox_national <- st_bbox(c(xmin = 130000, xmax = 660000, 
+                           ymin = 10000,  ymax = 660000), 
+                         crs = st_crs(sig_map_data))
+
+# --- 2. FETCH BACKGROUND ---
+# Zoom 7 is good for national
+bg_national <- get_tiles(bbox_national, provider = "CartoDB.PositronNoLabels", zoom = 7, crop = TRUE)
+
+# --- 3. VISUALIZATION ---
+my_breaks <- classIntervals(sig_map_data$coef_sig[!is.na(sig_map_data$coef_sig)], n = 5, style = "fisher")$brks
+
+tmap_mode("plot")
+
+tm_shape(bg_national) + 
+  tm_rgb() +
+  
+  # DATA LAYER
+  tm_shape(england_simple) +
+  tm_polygons("coef_sig", 
+              title = "Roman Effect",
+              breaks = my_breaks, 
+              palette = "plasma", 
+              midpoint = NA,
+              colorNA = "grey",
+              textNA = "Insignificant",
+              alpha = 0.8,
+              border.alpha = 0,
+              legend.show = TRUE,
+              legend.is.portrait = TRUE) +
+  
+  # ROAD LAYER
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.5, alpha = 0.5) +
+  
+  # CREDITS (Bottom Right)
+  tm_credits("Black lines = Roman Roads\nSource: Itiner-e Digital Atlas", 
+             position = c("right", "bottom"), 
+             size = 0.5,             # Smaller text
+             bg.color = "white", 
+             bg.alpha = 0.4) +
+
+  # LAYOUT FIXES
+  tm_layout(main.title = "Where History Matters: National GWR Roman Beta Coefficients", 
+            main.title.size = 1.0,
+            main.title.position = "center",
+        
+            legend.bg.color = "white",
+            legend.bg.alpha = 0.7,
+            # 3. SHRINK LEGEND
+            legend.title.size = 0.8,
+            legend.text.size = 0.6,
+            frame = TRUE)
+```
+pro map?
+```{r}
+# ... (Keep your data prep 1 & 2 the same) ...
+# --- 1. FETCH BACKGROUND (UPDATED) ---
+# "OpenStreetMap" gives you the classic look with town names.
+# "CartoDB.Positron" is a lighter alternative if OSM is too colorful.
+bg_national <- get_tiles(bbox_national, provider = "OpenStreetMap", zoom = 7, crop = FALSE)
+
+# --- 2. VISUALIZATION ---
+m <- tm_shape(bg_national) + 
+  tm_rgb(alpha = 0.7) +  # Fade the map slightly so your data pops out
+  
+  # DATA LAYER
+  tm_shape(england_simple) +
+  tm_polygons("coef_sig", 
+              title = "Roman Effect",
+              breaks = my_breaks, 
+              palette = "plasma", 
+              midpoint = NA,
+              colorNA = "grey", 
+              textNA = "Insignificant/dropped",
+              alpha = 0.7,      # Lower alpha slightly so town names show through
+              border.alpha = 0,
+              legend.show = TRUE,
+              legend.is.portrait = TRUE) +
+  
+  # ROAD LAYER
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 1.4, alpha = 0.2) +
+
+  # CREDITS
+  tm_credits("Black lines = Roman Roads\nSource: Itiner-e Digital Atlas", 
+             position = c("right", "bottom"), 
+             size = 0.9, bg.color = "white", bg.alpha = 0.6) +
+
+  # LAYOUT
+  tm_layout(
+    main.title = "Where History Matters: Local Roman Coefficients", 
+    main.title.size = 1.5,
+    main.title.position = "center",
+    main.title.fontface = "bold",
+    fontfamily = "sans", 
+    
+    # Legend Position (Adjust as needed)
+    legend.position = c(0.75, 0.95), 
+    legend.bg.color = "white",
+    legend.bg.alpha = 0.8,
+    legend.frame = TRUE,
+    legend.title.size = 1,
+    legend.text.size = 0.9,
+    frame = FALSE,
+    # Force camera to look at England (fixes blank map issue)
+    bbox = england_simple
+  )
+
+# Save
+tmap_save(m, filename = "imgs/beta_Map_Pro.png", dpi = 600, height = 10, width = 8)
+```
+
+
+```{r}
+library(dplyr)
+library(sf)
+
+print("=== 🏛️ RECOVERING IDS & FINDING WINNERS ===")
+
+# --- STEP 0: THE FIX ---
+# The GWR output lost the IDs. We copy them back from the original input data.
+# Note: Ensure 'gwr_data_sf' is the exact dataframe you fed into the GWR model.
+gwr_results_sf_simplified$msoa21cd <- gwr_data_sf$msoa21cd
+
+# (Optional: Check case sensitivity. If your ID is "MSOA21CD" in capitals, use that instead)
+
+
+# --- STEP 1: JOIN NAMES ---
+# Now the left_join will work because 'msoa21cd' exists in both.
+results_named <- gwr_results_sf_simplified %>%
+  left_join(st_drop_geometry(msoas_uk) %>% select(msoa21cd, msoa21nm), 
+            by = "msoa21cd")
+
+# --- STEP 2: DEFINE "ACTUALLY ROMAN" ---
+# Calculate the threshold from the INPUT data (the raw Roman scores)
+threshold <- quantile(gwr_data_sf$log_adj_decay_score, 0.25) 
+
+# --- STEP 3: JOIN RAW SCORES & CALCULATE T-VALUES ---
+clean_assets <- results_named %>%
+  st_drop_geometry() %>%
+  # Join raw Roman score to filter out "fake" positives (Cornwall effect)
+  left_join(st_drop_geometry(gwr_data_sf) %>% 
+              select(msoa21cd, raw_roman_score = log_adj_decay_score), 
+            by = "msoa21cd") %>%
+  # Calculate t-values (Coefficient / Standard Error) to check significance
+  # Note: Adjust column names if your GWR output names them differently (e.g. 'log_adj_decay_score_SE')
+  mutate(t_val = log_adj_decay_score / log_adj_decay_score_se)
+
+# --- STEP 4: REVEAL THE WINNERS ---
+print("=== 🏛️ TRUE ROMAN ASSETS (Significant, Positive, & Historically Roman) ===")
+
+top_winners <- clean_assets %>%
+  filter(abs(t_val) > 1.96) %>%           # 1. Statistically Significant
+  filter(log_adj_decay_score > 0) %>%     # 2. Positive Economic Impact
+  filter(raw_roman_score > threshold) %>% # 3. Actually Near a Road (Removes Cornwall)
+  arrange(desc(log_adj_decay_score)) %>%  # Sort by strength of effect
+  select(msoa21nm, local_coef = log_adj_decay_score, raw_roman_score, t_val) %>%
+  head(50)
+
+top_winners
+```
+
+try to auto plot winners and losers
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# --- STEP 1: DATA EXTRACTION ---
+# We take the map data, drop the shapefiles, and grab the extremes.
+ranked_data <- sig_map_data %>%
+  st_drop_geometry() %>%
+  filter(!is.na(coef_sig)) %>%
+  select(msoa21nm, coef_sig) %>%
+  arrange(desc(coef_sig)) # Sort High to Low
+
+# Grab Top 10 (Winners) and Bottom 10 (Losers)
+top_winners <- head(ranked_data, 5) %>% mutate(Type = "Winner")
+top_losers  <- tail(ranked_data, 5) %>% mutate(Type = "Loser")
+
+# Combine them for plotting
+plot_data <- bind_rows(top_winners, top_losers)
+
+# Clean MSOA names (Optional: removes redundant text if needed)
+# plot_data$msoa21nm <- gsub(" \\(England\\)", "", plot_data$msoa21nm)
+
+# --- STEP 2: THE VISUALIZATION ---
+ggplot(plot_data, aes(x = reorder(msoa21nm, coef_sig), y = coef_sig, fill = coef_sig)) +
+  
+  # 1. The Bars
+  geom_col(width = 0.7) +
+  
+  # 2. Add Value Labels (White text inside the bar for readability)
+  geom_text(aes(label = round(coef_sig, 2), 
+                hjust = ifelse(coef_sig > 0, 1.2, -0.2)), # Adjust position based on +/-
+            color = "white", size = 3.5, fontface = "bold") +
+  
+  # 3. Flip Coordinates (Make it horizontal)
+  coord_flip() +
+  
+  # 4. Colors (Matches your 'Plasma' Map)
+  scale_fill_viridis_c(option = "plasma", name = "Coefficient") +
+  
+  # 5. Labels & Captions
+  labs(title = "The Roman Divide",
+       subtitle = "The neighborhoods with the most extreme coefficients",
+       x = NULL, # No X label needed (names are self-explanatory)
+       y = "Local Roman Coefficient") +
+  
+  # 6. Professional Theme
+  theme_minimal()
+```
+
+
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# 1. PREPARE THE DATA
+# We extract the coefficients and calculate the t-values
+hist_data <- gwr_results_sf_simplified %>%
+  st_drop_geometry() %>%
+  mutate(
+    t_val = log_adj_decay_score / log_adj_decay_score_se,
+    
+    # Classify each town into 3 buckets
+    Category = case_when(
+      t_val > 1.96  ~ "Significant Positive (Asset)",
+      t_val < -1.96 ~ "Significant Negative (Trap)",
+      TRUE          ~ "Insignificant (Noise)"
+    )
+  ) %>%
+  # FILTER OUTLIERS: We zoom in to the "Realistic Economy" zone (-1 to +1)
+  # This ignores the crazy Cornwall errors so we can see the real pattern.
+  filter(log_adj_decay_score > -2 & log_adj_decay_score < 2)
+
+# 2. PLOT THE HISTOGRAM
+ggplot(hist_data, aes(x = log_adj_decay_score, fill = Category)) +
+  # Create the bars
+  geom_histogram(binwidth = 0.05, color = "black", alpha = 0.8) +
+  
+  # Color them correctly
+  scale_fill_manual(values = c("grey80", "forestgreen", "purple")) +
+  
+  # Add a center line at 0 (Neutral)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", size = 1) +
+  
+  # Labels and Titles
+  labs(title = "Distribution of the Roman Effect (GWR Coefficients)",
+       subtitle = "Green = Significant Assets | Purple = Significant Traps | Grey = Noise",
+       x = "Local Coefficient (Elasticity)",
+       y = "Number of MSOAs (Towns)") +
+  
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+
+
+
+
+
+
+
+R^2 mapped
+
+```{r}
+# 1. RETRIEVE GLOBAL OLS METRICS
+global_model <- lm(log_income ~ log_adj_decay_score + 
+                     log(pop_density) + 
+                     education_score + 
+                     health_score + 
+                     log_dist_london + 
+                     pct_long_hours, 
+                   data = gwr_data_sf)
+
+print("--- MODEL FIGHT: OLS vs. GWR ---")
+
+# 2. CHECK IF AIC IS AVAILABLE (The Crash Fix)
+# We look inside the results to see if AIcc exists
+if (!is.null(gwr_model$results$AIcc)) {
+  ols_aic <- AIC(global_model)
+  gwr_aic <- gwr_model$results$AIcc
+  
+  print(paste("Global OLS AIC:", round(ols_aic, 2)))
+  print(paste("GWR AICc:      ", round(gwr_aic, 2)))
+  print(paste("Difference:    ", round(ols_aic - gwr_aic, 2)))
+  
+  if((ols_aic - gwr_aic) > 3) {
+    print("RESULT: VICTORY. GWR is statistically superior.")
+  }
+} else {
+  print("WARNING: AICc is missing (Likely because hatmatrix=FALSE).")
+  print("Skipping AIC test. Relying on R-Squared below.")
+}
+
+# 3. R-SQUARED COMPARISON (This always works)
+# OLS R2
+ols_r2 <- summary(global_model)$r.squared
+
+# GWR R2 - We calculate the mean of the local R2 values
+# Note: In spgwr, localR2 is stored in the SDF object
+gwr_r2_mean <- mean(gwr_model$SDF$localR2, na.rm = TRUE)
+
+print(paste("Global OLS R2: ", round(ols_r2, 3)))
+print(paste("GWR Mean R2:   ", round(gwr_r2_mean, 3)))
+
+# 4. MAP THE PERFORMANCE (Local R2)
+tmap_mode("plot")
+
+tm_shape(gwr_results_sf_simplified) +
+  tm_polygons("localR2",
+              title = "Local R-Squared\n(Model Fit)",
+              style = "cont",         
+              palette = "Blues",      # Dark Blue = High Accuracy
+              border.alpha = 0,
+              popup.vars = c("Local R2" = "localR2")) +
+  
+  tm_layout(main.title = "Where is the model smartest?",
+            # legend.position = c("right", "bottom"),
+            legend.outside.position = "right",
+            legend.outside = TRUE,
+            frame = FALSE)
+```
+
+```{r}
+# 1. RE-CALCULATE GLOBAL OLS (Just to be sure we compare apples to apples)
+global_model <- lm(log_income ~ log_adj_decay_score + 
+                     log(pop_density) + 
+                     education_score + 
+                     health_score + 
+                     log_dist_motorway + 
+                     log_dist_london + 
+                     pct_long_hours, 
+                   data = gwr_data_sf)
+
+# 2. EXTRACT THE METRICS
+# OLS Scores
+ols_aic <- AIC(global_model)
+ols_r2  <- summary(global_model)$r.squared
+
+# GWR Scores (Now available because hatmatrix=TRUE)
+gwr_aic <- gwr_model$results$AICc
+gwr_r2  <- mean(gwr_model$SDF$localR2)
+
+# 3. PRINT THE RESULTS
+print("========================================")
+print("      FINAL MODEL COMPARISON            ")
+print("========================================")
+print(paste("Global OLS AIC:   ", round(ols_aic, 2)))
+print(paste("GWR AICc:         ", round(gwr_aic, 2)))
+print("----------------------------------------")
+print(paste("DIFFERENCE (AIC): ", round(ols_aic - gwr_aic, 2)))
+print("========================================")
+
+# 4. THE VERDICT
+diff <- ols_aic - gwr_aic
+if(diff > 3) {
+  print("✅ VICTORY: GWR is statistically superior.")
+  print("   (The drop in AICc proves spatial non-stationarity exists.)")
+} else {
+  print("❌ DEFEAT: GWR did not improve the model enough.")
+  print("   (The extra complexity wasn't worth it.)")
+}
+
+print(" ")
+print(paste("Global OLS R-Squared: ", round(ols_r2, 3)))
+print(paste("GWR Average R-Squared:", round(gwr_r2, 3)))
+```
+
+
+comparing the 3 models
+```{r}
+# 1. EXTRACT AIC SCORES
+ols_aic <- AIC(global_model)
+sem_aic <- AIC(final_spatial_model)
+gwr_aic <- gwr_model$results$AICc
+
+# 2. PRINT THE LEADERBOARD
+print("==========================================")
+print("      🏆 ULTIMATE MODEL CHAMPIONSHIP      ")
+print("==========================================")
+print(paste("1. Global OLS AIC:   ", round(ols_aic, 1)))
+print(paste("2. Spatial Error SEM:", round(sem_aic, 1)))
+print(paste("3. Local GWR AICc:   ", round(gwr_aic, 1)))
+print("------------------------------------------")
+
+# Calculate Improvements
+imp_sem <- ols_aic - sem_aic
+imp_gwr <- sem_aic - gwr_aic
+
+print(paste("Improvement OLS -> SEM: ", round(imp_sem, 1), "(Spatial Clustering Effect)"))
+print(paste("Improvement SEM -> GWR: ", round(imp_gwr, 1), "(Spatial Non-Stationarity Effect)"))
+
+print("==========================================")
+if(gwr_aic < sem_aic & (sem_aic - gwr_aic) > 3) {
+  print("✅ FINAL VERDICT: GWR WINS.")
+  print("   (The relationship varies significantly across space.)")
+} else if(sem_aic < ols_aic) {
+  print("⚠️ FINAL VERDICT: SEM WINS.")
+  print("   (Spatial clustering matters, but the Roman effect is uniform.)")
+}
+print("==========================================")
+```
+
+
+# in the GWR are there some areas with roman as the most important variable?
+
+```{r}
+# 1. CALCULATE GLOBAL STANDARD DEVIATIONS (The "Equalizer")
+# We measure how "spread out" each variable is across the whole country
+sd_roman <- sd(gwr_data_sf$log_adj_decay_score, na.rm=TRUE)
+sd_educ  <- sd(gwr_data_sf$education_score, na.rm=TRUE)
+sd_health <- sd(gwr_data_sf$health_score, na.rm=TRUE)
+
+print(paste("SD Roman:", round(sd_roman, 2)))
+print(paste("SD Education:", round(sd_educ, 2)))
+
+# 2. STANDARDIZE THE GWR COEFFICIENTS
+# We multiply the coefficient by the SD to get the "Standardized Beta"
+# We take Absolute Value (abs) because we care about STRENGTH, not direction (+/-)
+gwr_results_sf_simplified$std_beta_roman  <- abs(gwr_results_sf_simplified$log_adj_decay_score * sd_roman)
+gwr_results_sf_simplified$std_beta_educ   <- abs(gwr_results_sf_simplified$education_score * sd_educ)
+gwr_results_sf_simplified$std_beta_health <- abs(gwr_results_sf_simplified$health_score * sd_health)
+
+# 3. FIND THE WINNER
+# We compare the three standardized scores for every single MSOA
+gwr_results_sf_simplified$dominant_driver <- apply(
+  st_drop_geometry(gwr_results_sf_simplified[, c("std_beta_roman", "std_beta_educ", "std_beta_health")]), 
+  1, # For each row
+  function(x) {
+    # If Roman is the biggest number, return "History"
+    # If Education is biggest, return "Education"
+    # etc.
+    names(x)[which.max(x)] 
+  }
+)
+
+# Rename for pretty map
+gwr_results_sf_simplified$dominant_driver <- factor(
+  gwr_results_sf_simplified$dominant_driver,
+  levels = c("std_beta_roman", "std_beta_educ", "std_beta_health"),
+  labels = c("History (Roman)", "Education", "Health")
+)
+
+# 4. MAP THE WINNERS
+tmap_mode("plot")
+
+tm_shape(gwr_results_sf_simplified) +
+  tm_polygons("dominant_driver",
+              title = "Dominant Driver of Wealth",
+              palette = c("red", "orange", "blue"), # red=Roman, Orange=Edu, Blue=Health
+              border.alpha = 0,
+              alpha = 0.8) +
+  
+  tm_layout(main.title = "The Battle for Dominance: Which Variable Matters Most?",
+            frame = FALSE)
+```
+
+model validations
+```{r}
+
+
+library(performance)
+library(see)       # Required for the plots
+library(car)       # For VIF
+library(spdep)     # For Moran's I
+library(tmap)      # For Mapping
+
+
+# 1. VISUAL CHECK (Linearity, Normality, Homoscedasticity)
+# This creates the "Dashboard" plot you saw on the website.
+# It checks: 
+# - Linearity (Residuals vs Fitted)
+# - Homoscedasticity (Scale-Location)
+# - Normality (QQ Plot)
+# - Outliers (Cook's Distance)
+check_model(global_model, check = c("linearity", "homogeneity", "qq", "outliers"))
+```
+
+
+```{r}
+# 1. CALCULATE VIF (If not already done)
+vif_scores <- vif(global_model)
+
+# 2. SETUP MARGINS
+# The vector is c(bottom, left, top, right)
+# We increase the 'left' margin (2nd number) from the default 4 to 12
+par(mar = c(5, 12, 4, 2))
+
+# 3. PLOT
+barplot(vif_scores, 
+        main = "Assumption 4: Multicollinearity (VIF Scores)", 
+        horiz = TRUE,         # Horizontal bars
+        col = "steelblue",    # Professional blue
+        las = 1,              # Force all text to be horizontal
+        cex.names = 0.8,      # Shrink text slightly to ensure it fits
+        xlim = c(0, 5))       # Set x-axis limit to 5 (the danger zone)
+
+# 4. ADD REFERENCE LINE
+# We add a red dashed line at 5. If bars stay left of this, you win.
+abline(v = 5, col = "red", lty = 2, lwd = 2)
+
+# Optional: Add a text label for the threshold
+text(x = 5, y = 1, labels = "Threshold (5)", col = "red", pos = 3, cex = 0.8)
+
+# 5. RESET MARGINS (Good practice so future plots don't look weird)
+par(mar = c(5, 4, 4, 2) + 0.1)
+```
+
+```{r}
+print("--- ASSUMPTION 5: SPATIAL INDEPENDENCE ---")
+
+# A. EXTRACT RESIDUALS
+# We verify the data length matches before adding
+if(nrow(gwr_results_sf_simplified) == length(residuals(global_model))) {
+  gwr_results_sf_simplified$ols_residuals <- residuals(global_model)
+} else {
+  print("Warning: Row counts didn't match perfectly. Using safe merge...")
+  gwr_results_sf_simplified$ols_residuals <- NA
+  gwr_results_sf_simplified$ols_residuals[as.numeric(names(residuals(global_model)))] <- residuals(global_model)
+}
+
+# B. MORAN'S I TEST (The Statistical Proof)
+# (Using the 6-nearest neighbors weights we created earlier)
+moran_test <- lm.morantest(global_model, lw_clean)
+print(moran_test)
+
+# C. MAP THE RESIDUALS (The Visual Proof)
+# Andrew uses Red/Blue diverging palettes to show clustering.
+tmap_mode("plot")
+
+tm_shape(gwr_results_sf_simplified) +
+  tm_polygons("ols_residuals",
+              title = "OLS Residuals",
+              style = "fisher",     # Fisher breaks are good for finding clusters
+              palette = "-RdBu",    # Red = Under-prediction, Blue = Over-prediction
+              midpoint = 0,
+              border.alpha = 0,
+              colorNA = "grey90") +
+  tm_layout(main.title = "Assumption 5 Check: Are Errors Clustered?",
+            legend.position = c("left", "bottom"),
+            frame = FALSE)
+```
+
+
+
+```{r}
+library(spdep)
+
+print("--- ASSUMPTION 5: SPATIAL INDEPENDENCE (Moran's I) ---")
+
+# 1. RUN THE TEST
+# H0 (Null Hypothesis): Errors are random (Spatial Independence).
+# H1 (Alt Hypothesis): Errors are clustered (Spatial Autocorrelation).
+moran_result <- lm.morantest(global_model, lw_clean, alternative = "two.sided")
+
+print(moran_result)
+
+# 2. INTERPRETATION HELPER
+if(moran_result$p.value < 0.05) {
+  print("❌ RESULT: SIGNIFICANT CLUSTERING (Assumption Failed).")
+  print("The p-value is < 0.05, meaning the residuals are NOT random.")
+  print("This confirms that OLS is biased and justifies using SEM/GWR.")
+} else {
+  print("✅ RESULT: RANDOM ERRORS (Assumption Passed).")
+}
+```
+
+
+DIAGNOSTICS ERROR SPATIAL MODEL
+
+```{r}
+library(spatialreg)
+library(ggplot2)
+library(gridExtra)
+
+# 1. DEFINE THE DASHBOARD FUNCTION (With Smaller Fonts)
+create_spatial_dashboard <- function(resid, fitted, model_name) {
+  
+  # Define a common theme update to apply to all plots
+  # Change 'size = 10' to make it even smaller or larger
+  my_theme <- theme_minimal() + 
+              theme(plot.title = element_text(size = 10, face = "bold", hjust = 0.5),
+                    axis.title = element_text(size = 9),
+                    axis.text  = element_text(size = 8))
+
+  # A. Linearity (Residuals vs Fitted)
+  p1 <- ggplot(data.frame(f = fitted, r = resid), aes(x = f, y = r)) +
+    geom_point(alpha = 0.3, color = "blue") +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed", size = 0.8) +
+    geom_smooth(method = "loess", se = FALSE, color = "darkgreen", size = 0.8) +
+    labs(title = paste("1. Linearity:", model_name), 
+         x = "Fitted Values", y = "Residuals") +
+    my_theme
+
+  # B. Homoscedasticity (Scale-Location)
+  std_resid <- sqrt(abs(resid))
+  p2 <- ggplot(data.frame(f = fitted, sr = std_resid), aes(x = f, y = sr)) +
+    geom_point(alpha = 0.3, color = "purple") +
+    geom_smooth(method = "loess", se = FALSE, color = "red", size = 0.8) +
+    labs(title = paste("2. Homoscedasticity:", model_name), 
+         x = "Fitted Values", y = "√|Standardized Residuals|") +
+    my_theme
+
+  # C. Normality (Histogram)
+  p3 <- ggplot(data.frame(r = resid), aes(x = r)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "skyblue", color = "white") +
+    geom_density(color = "darkblue", size = 0.8) +
+    labs(title = paste("3. Normality:", model_name), x = "Residuals", y = "Density") +
+    my_theme
+
+  # D. Normality (Q-Q Plot)
+  p4 <- ggplot(data.frame(r = resid), aes(sample = r)) +
+    stat_qq(alpha = 0.3) +
+    stat_qq_line(color = "red", size = 0.8) +
+    labs(title = "4. Q-Q Plot", x = "Theoretical", y = "Sample") +
+    my_theme
+
+  # Combine them into a grid
+  grid.arrange(p1, p2, p3, p4, ncol = 2)
+}
+
+# 2. RUN FOR SPATIAL ERROR MODEL (SEM)
+print("--- GENERATING SEM DASHBOARD ---")
+sem_resid  <- residuals(final_spatial_model)
+sem_fitted <- fitted(final_spatial_model)
+
+create_spatial_dashboard(sem_resid, sem_fitted, "SEM")
+
+# 3. RUN FOR GWR MODEL
+print("--- GENERATING GWR DASHBOARD ---")
+# Extract GWR math
+gwr_resid  <- gwr_model$SDF$gwr.e
+gwr_fitted <- gwr_model$SDF$pred
+
+create_spatial_dashboard(gwr_resid, gwr_fitted, "GWR")
+
+```
+
+```{r}
+library(spdep)
+library(tmap)
+library(sf)
+
+print("=========================================")
+print("   ASSUMPTION 5: INDEPENDENCE CHECK      ")
+print("=========================================")
+
+# -------------------------------------------------------
+# 1. PREPARE THE RESIDUALS
+# -------------------------------------------------------
+# OLS Residuals
+ols_resid <- residuals(global_model)
+
+# SEM Residuals
+sem_resid <- residuals(final_spatial_model)
+
+# GWR Residuals (Extracted from the SpatialDataFrame)
+gwr_resid <- gwr_model$SDF$gwr.e 
+
+# Add them to your spatial data for mapping
+# (We use a safe merge to ensure rows align)
+map_data <- gwr_results_sf_simplified
+map_data$resid_ols <- ols_resid
+map_data$resid_sem <- sem_resid
+map_data$resid_gwr <- gwr_resid
+
+# -------------------------------------------------------
+# 2. STATISTICAL TEST (Moran's I)
+# -------------------------------------------------------
+print("--- TEST RESULTS: MORAN'S I ---")
+
+# A. OLS (The Baseline)
+# We expect this to FAIL (p < 0.05)
+ols_moran <- lm.morantest(global_model, lw_clean)
+print(paste("1. OLS Moran's I:", round(ols_moran$estimate[1], 4), 
+            "(p-value:", format.pval(ols_moran$p.value, digits=3), ")"))
+
+# B. SEM (The Spatial Fix)
+# This usually lowers the clustering significantly.
+sem_moran <- moran.test(sem_resid, lw_clean)
+print(paste("2. SEM Moran's I:", round(sem_moran$estimate[1], 4), 
+            "(p-value:", format.pval(sem_moran$p.value, digits=3), ")"))
+
+# C. GWR (The Local Fix)
+# This should be the closest to zero (Random).
+gwr_moran <- moran.test(gwr_resid, lw_clean)
+print(paste("3. GWR Moran's I:", round(gwr_moran$estimate[1], 4), 
+            "(p-value:", format.pval(gwr_moran$p.value, digits=3), ")"))
+
+# --------------------------------
+```
+
+
+```{r}
+library(tmap)
+library(sf)
+
+# 1. PREPARE THE DATA
+# Ensure the residuals are attached to your map object
+map_data <- gwr_results_sf_simplified
+
+# Attach SEM Residuals
+map_data$resid_sem <- residuals(final_spatial_model)
+
+# Attach GWR Residuals
+map_data$resid_gwr <- gwr_model$SDF$gwr.e 
+
+# 2. DEFINE SHARED MAP SETTINGS
+# We create a reusable layout to make the comparison fair and clean
+my_map_style <- tm_layout(legend.position = c("left", "bottom"), 
+                          frame = FALSE, 
+                          title.size = 0.9,
+                          legend.bg.color = "white",
+                          legend.bg.alpha = 0.8)
+
+# 3. CREATE SEM MAP (Spatial Error Model)
+map_sem <- tm_shape(map_data) +
+  tm_polygons("resid_sem", 
+              title = "SEM Residuals", 
+              style = "fisher",      # Smart breaks for clustering
+              palette = "-RdBu",     # Red = Under-predicted, Blue = Over-predicted
+              midpoint = 0, 
+              border.alpha = 0,
+              colorNA = "grey90") +
+  
+  # Add the Roman Roads (England Subset)
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.5, alpha = 0.3) +
+  
+  tm_layout(title = "1. SEM Residuals") + my_map_style
+
+# 4. CREATE GWR MAP (Local Model)
+map_gwr <- tm_shape(map_data) +
+  tm_polygons("resid_gwr", 
+              title = "GWR Residuals", 
+              style = "fisher", 
+              palette = "-RdBu", 
+              midpoint = 0, 
+              border.alpha = 0,
+              colorNA = "grey90") +
+  
+  # Add the Roman Roads (England Subset)
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "black", lwd = 0.5, alpha = 0.3) +
+  
+  tm_layout(title = "2. GWR Residuals (Clean)") + my_map_style
+
+# 5. PLOT SIDE-BY-SIDE
+tmap_arrange(map_sem, map_gwr, ncol = 2)
+```
+
+
+
+
+# Some extra visualizations
+```{r}
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# 1. DATA PREP (Same as before)
+target_places <- data.frame(
+  msoa21nm = c("City of London 001", "St Albans 014", "Bath and North East Somerset 010", 
+               "Chester 006", "York 008", "Dover 004", "Leicester 015", 
+               "Newcastle upon Tyne 018", "Carlisle 005", "Brighton and Hove 015", 
+               "Manchester 015", "Birmingham 030", "Leeds 025", 
+               "King's Lynn and West Norfolk 002", "Cornwall 040"),
+  display_label = c("City of London 001 (Londinium)", "St Albans 014 (Verulamium)", "Bath 010 (Aquae Sulis)",
+                    "Chester 006 (Deva Victrix)", "York 008 (Eboracum)", "Dover 004 (Dubris)",
+                    "Leicester 015 (Ratae)", "Newcastle 018 (Pons Aelius)", "Carlisle 005 (Luguvalium)",
+                    "Brighton and Hove 015", "Manchester 015 (Mamucium)", "Birmingham 030",
+                    "Leeds 025 (West Yorkshire)", "King's Lynn and West Norfolk 002 (Rural East)", "Cornwall (The Frontier)")
+)
+
+plot_data <- msoas_with_income_simplified %>%
+  st_drop_geometry() %>%
+  inner_join(target_places, by = "msoa21nm") %>%
+  select(display_label, log_adj_decay_score) %>%
+  arrange(desc(log_adj_decay_score))
+
+# 2. CREATE THE BLUE PLOT
+ggplot(plot_data, aes(x = reorder(display_label, log_adj_decay_score), 
+                      y = log_adj_decay_score)) +
+  
+  # A. The Bars: Professional "Steel Blue"
+  geom_col(fill = "#4682B4", width = 0.7) + 
+  
+  # B. Flip to Horizontal
+  coord_flip() +
+  
+  # C. Data Labels: Standard Sans-Serif Font
+  geom_text(aes(label = sprintf("%.1f", log_adj_decay_score)), 
+            hjust = -0.3, 
+            # family = "serif",  <-- REMOVED to revert to normal
+            color = "#333333", 
+            size = 4,
+            fontface = "bold") +
+  
+  # D. Titles
+  labs(title = "The Roman Hierarchy: selected examples",
+       subtitle = "Centrality Score (Log) of selected neighborhoods",
+       caption = "Source: Itiner-e Roman Roads Dataset & ONS Census 2021",
+       x = NULL,
+       y = "Roman Centrality Score") +
+  
+  # E. Theme (Standard Sans-Serif)
+  theme_minimal() + 
+  theme(
+      # 1. Force the title to align to the whole PLOT, not just the inner panel
+      plot.title.position = "plot", 
+      plot.caption.position = "plot",
+  
+      # 2. Use hjust = 0 for left alignment
+      plot.title = element_text(face = "bold", size = 18, color = "#1a1a1a", hjust = 0),
+      plot.subtitle = element_text(size = 12, color = "#4a4a4a", hjust = 0),
+      plot.caption = element_text(size = 8, color = "grey60", margin = margin(t = 10), hjust = 0), # Optional: left align caption too?
+      
+      # ... rest of your theme settings ...
+      axis.text.y = element_text(size = 11, color = "#2b2b2b"),
+      axis.text.x = element_blank(),     
+      panel.grid.major.y = element_blank(), 
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_line(color = "grey90", linetype = "dotted"),
+      plot.margin = margin(20, 20, 20, 20)
+    )
+  
+  # F. Expansion
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+```
+
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(sf)
+
+# 1. PREPARE THE DATA
+# We take the clean dataframe 'gwr_data_sf'
+plot_data_controls <- gwr_data_sf %>%
+  st_drop_geometry() %>%
+  # Create the Log Transformation for Density
+  mutate(log_pop_density = log(pop_density)) %>%
+  select(education_score, health_score, log_pop_density) %>%
+  
+  # Rename for clean plot labels
+  rename(
+    "Education Score" = education_score,
+    "Health Score" = health_score,
+    "Population Density (Log)" = log_pop_density
+  ) %>%
+  
+  # Reshape to long format for faceting
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# 2. CREATE THE DASHBOARD PLOT
+ggplot(plot_data_controls, aes(x = Value, fill = Variable)) +
+  
+  # A. The Histograms
+  # bins=30 is standard, 'color="white"' adds the clean separators between bars
+  geom_histogram(bins = 40, color = "white", alpha = 0.85) +
+  
+  # B. Facet Wrap (Side-by-side panels)
+  facet_wrap(~Variable, scales = "free", ncol = 3) +
+  
+  # C. Custom "Journalism" Palette
+  scale_fill_manual(values = c("#2A9D8F", "#E9C46A", "#F4A261")) +
+  
+  # D. Labels & Titles
+  labs(title = "The Control Variables",
+       subtitle = "Distribution of Education, Health, and Density across England",
+       caption = "Source: ONS Census 2021. Density is log-transformed.",
+       y = "Count of Neighborhoods",
+       x = "Score / Value") +
+  
+  # E. Theme Styling
+  theme_minimal() +
+  theme(
+    # Typography
+    plot.title = element_text(face = "bold", size = 16, hjust = 0, color = "#1a1a1a"),
+    plot.subtitle = element_text(size = 11, color = "grey40", margin = margin(b = 20)),
+    strip.text = element_text(face = "bold", size = 11, color = "#333333"),
+    
+    # Legend (Not needed since titles explain it)
+    legend.position = "none",
+    
+    # Clean Grid
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    
+    # Margins
+    plot.margin = margin(20, 20, 20, 20)
+  )
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(sf)
+
+# 1. PREPARE THE DATA
+# We select all relevant variables from the final dataset
+plot_data_full <- gwr_data_sf %>%
+  st_drop_geometry() %>%
+  
+  # Ensure we have the log versions where needed for the plot
+  # (Adjust column names if yours differ slightly, e.g., 'dist_london' vs 'log_dist_london')
+  mutate(
+    log_pop_density = log(pop_density),
+    # If your data doesn't have these exact names, standardise them here:
+    # log_dist_london = log(dist_london), 
+    # log_dist_motorway = log(dist_motorway)
+  ) %>%
+  
+  # Select the 8 key variables
+  select(
+    log_income,          # The Outcome
+    log_adj_decay_score,   # The Main Predictor
+    education_score,       # Control 1
+    health_score,          # Control 2
+    log_pop_density,       # Control 3
+    log_dist_london,       # Control 4
+    log_dist_motorway,     # Control 5
+    pct_long_hours         # Control 6
+  ) %>%
+  
+  # Rename for professional plot labels
+  rename(
+    "Annual Avg Income (Log £)" = log_income,
+    "Roman Centrality (Log)" = log_adj_decay_score,
+    "Education deprivation" = education_score,
+    "Health deprivation" = health_score,
+    "Population Density (Log)" = log_pop_density,
+    "Dist to London (Log)" = log_dist_london,
+    "Dist to Motorway (Log)" = log_dist_motorway,
+    "% Long Hours" = pct_long_hours
+  ) %>%
+  
+  # Reshape for Faceting
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+# 2. CREATE THE FULL DASHBOARD
+ggplot(plot_data_full, aes(x = Value, fill = Variable)) +
+  
+  # A. The Histograms
+  # bins=40 gives good detail. Color=white separates the bars.
+  geom_histogram(bins = 40, color = "white", linewidth = 0.1, alpha = 0.9) +
+  
+  # B. Facet Wrap
+  # ncol=4 creates a nice 2x4 grid
+  facet_wrap(~Variable, scales = "free", ncol = 4) +
+  
+  # C. Color Palette
+  # We use 'viridis' (discrete) to give each variable a distinct, professional color
+  scale_fill_viridis_d(option = "plasma", direction = -1) +
+  
+  # D. Labels
+  labs(title = "The Model Ingredients",
+       subtitle = "Distributions of all variables used in the final analysis",
+       caption = "Source: ONS Census 2021, Itiner-e, 2025 Index Of Deprivation",
+       y = "Neighborhood Count",
+       x = "Value") +
+  
+  # E. Theme
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 18, hjust = 0, color = "#1a1a1a"),
+    plot.subtitle = element_text(size = 12, color = "grey40", margin = margin(b = 20)),
+    
+    # Strip text (Panel titles)
+    strip.text = element_text(face = "italic", size = 8, color = "#333333"),
+    
+    # Remove Legend (Redundant)
+    legend.position = "none",
+    
+    # Clean up the grid
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 7),
+    
+    # Margins
+    plot.margin = margin(20, 20, 20, 20)
+  )
+```
+
+
+
+
+global model vis
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+# 1. CREATE DATA FRAME FROM YOUR RESULTS
+# We manually input the coefficients you pasted
+model_results <- tribble(
+  ~Variable,              ~Estimate,   ~Type,
+  "Health Deprivation",   -0.1334,     "Control",
+  "Dist to London",       -0.0908,     "Control",
+  "Dist to Motorway",     -0.0163,     "Control",
+  "Pop Density",           0.0099,     "Control",
+  "Roman Centrality",      0.0082,     "Focus",    # <--- The Tiny Hero
+  "Education Deprivation",-0.0046,     "Control"
+)
+
+# 2. CREATE THE PLOT
+ggplot(model_results, aes(x = reorder(Variable, abs(Estimate)), y = Estimate, fill = Type)) +
+  
+  # A. The Bars
+  geom_col(width = 0.7) +
+  
+  # B. Flip coordinates (so names are on the left)
+  coord_flip() +
+  
+  # C. Colors: Make Roman distinct ("Roman Red" vs "Grey Controls")
+  scale_fill_manual(values = c("grey70", "#8B0000")) +
+  
+  # D. Add the Numbers (Percent Impact) for the reader
+  geom_text(aes(label = sprintf("%.1f%%", Estimate * 100), 
+                hjust = ifelse(Estimate > 0, -0.2, 1.2)), # Adjust position based on +/-
+            size = 4, fontface = "bold", color = "#333333") +
+  
+  # E. Labels
+  labs(title = "The False Verdict: 'History Doesn't Matter'",
+       subtitle = "Estimated impact of variables on Income (Global OLS Model)",
+       caption = "Note: Coefficients represent % change in income for a unit increase in log predictor.",
+       y = "Impact on Income (Coefficient)",
+       x = NULL) +
+  
+  # F. Theme
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0),
+    plot.subtitle = element_text(size = 11, color = "grey40"),
+    legend.position = "none",
+    axis.text.y = element_text(size = 11, face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+
+
+
+Caterppillar?
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(sf)
+
+# --- STEP 1: PREP DATA ---
+# 1. Drop geometry (we don't need the map shapes for a scatter plot)
+# 2. Filter for only significant values (remove NAs)
+# 3. Sort them from lowest to highest
+# 4. Add a "Rank" column (1, 2, 3... N) for the X-axis
+plot_data <- sig_map_data %>%
+  st_drop_geometry() %>%
+  filter(!is.na(coef_sig)) %>%
+  arrange(coef_sig) %>%
+  mutate(rank = row_number())
+
+# --- STEP 2: PLOT ---
+ggplot(plot_data, aes(x = rank, y = coef_sig, color = coef_sig)) +
+  
+  # 1. The Points (One dot per MSOA)
+  geom_point(size = 0.5, alpha = 0.8) +
+  
+  # 2. Zero Line (The "Neutral" Horizon)
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey30", size = 0.8) +
+  
+  # 3. Annotation Text (Optional but helpful)
+  annotate("text", x = 500, y = min(plot_data$coef_sig), 
+           label = "The 'Trap'", color = "grey30", fontface = "bold", hjust = 0) +
+  annotate("text", x = max(plot_data$rank) - 500, y = max(plot_data$coef_sig), 
+           label = "The 'Spine'", color = "grey30", fontface = "bold", hjust = 1) +
+
+  # 4. Colors (Matching your map's Plasma theme)
+  scale_color_viridis_c(option = "plasma", name = "Coefficient") +
+  
+  # 5. Labels
+  labs(title = "The Spectrum of Roman Influence",
+       subtitle = paste0("Sorted coefficients for ", nrow(plot_data), " significant MSOAs"),
+       x = "Neighborhood Rank (Sorted Low to High)",
+       y = "Roman Effect (GWR Coefficient)") +
+  
+  # 6. Theme
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+roman roads standalone
+
+```{r}
+# 1. Save the map object to a variable first
+my_final_map <- tm_shape(bg_roman) + 
+  tm_rgb() +
+  tm_shape(roman_roads_england) +
+  tm_lines(col = "#1a1a1a", lwd = 1.5, alpha = 0.85) +
+  tm_compass(type = "8star", position = c("right", "top"), size = 2, text.color = "grey30") +
+  tm_scale_bar(breaks = c(0, 50, 100), position = c("right", "bottom"), text.size = 0.6, color.dark = "grey30") +
+  tm_credits("Source: Itiner-e Digital Atlas", position = c("right", "bottom"), size = 0.5, col = "grey50") +
+  tm_layout(main.title = "The Roman Road Network in England",
+            main.title.position = "center", main.title.fontface = "bold", main.title.size = 1.3,
+            # CRITICAL: Set margins to 0 to fill the frame
+            inner.margins = c(0, 0, 0, 0),
+            outer.margins = c(0, 0, 0, 0),
+            frame = TRUE, frame.lwd = 1.5, bg.color = "white")
+
+# 2. Save it with a TALL aspect ratio (e.g., Height is double the Width)
+tmap_save(tm = my_final_map, 
+          filename = "imgs/Roman_Roads_England_BIG.png", 
+          width = 5,         # Narrow width
+          height = 9,        # Tall height (Portrait orientation)
+          units = "in",      # Inches
+          dpi = 600)         # High resolution for print
+```
+
